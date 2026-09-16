@@ -6,7 +6,7 @@ read_globals = {
   -- CC:Tweaked global APIs used by install.lua / startup.lua
   "fs", "http", "term", "peripheral", "shell", "textutils",
   "colors", "colours", "keys", "sleep", "write", "read", "printError",
-  -- Cobalt ships the Lua 5.3 utf8 library (utf8.len etc.).
+  -- CC:Tweaked's Cobalt provides the utf8 library (utf8.len etc.).
   "utf8",
 }
 
