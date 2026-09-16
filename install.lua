@@ -153,6 +153,37 @@ local function readN(handle, n)
   return table.concat(out), got
 end
 
+-- Wrap a binary HTTP handle so `read(n)` behaves the way the extractor below
+-- expects: blocking, returning nil only at end of stream.
+--
+-- CC:Tweaked's http handle already does this. CraftOS-PC does not: there
+-- `read(n)` is a non-blocking readsome() that can return "" while the body is
+-- still downloading, so the reference extractor would stop at the first header
+-- and extract nothing. On the first empty read we fall back to readAll(), which
+-- blocks until the whole (small, ~486 KB) response is buffered, and then serve
+-- the remaining reads from memory. Real hardware keeps true streaming.
+local function blockingHandle(handle)
+  local body, pos = nil, 1
+  return {
+    read = function(n)
+      if body then
+        if pos > #body then return nil end
+        local chunk = body:sub(pos, pos + n - 1)
+        pos = pos + #chunk
+        return chunk
+      end
+      local chunk = handle.read(n)
+      if chunk ~= nil and #chunk == 0 then
+        body = handle.readAll() or ""
+        if pos > #body then return nil end
+        chunk = body:sub(pos, pos + n - 1)
+        pos = pos + #chunk
+      end
+      return chunk
+    end,
+  }
+end
+
 -- Stream a (uncompressed) USTAR archive from an HTTP handle into `root`.
 local function untar(handle, root)
   local count = 0
@@ -234,7 +265,7 @@ for i = 1, #sources do
   if not handle then
     log("  download failed: %s", tostring(err))
   else
-    local files = untar(handle, root)
+    local files = untar(blockingHandle(handle), root)
     handle.close()
     log("  extracted %d files", files)
 
