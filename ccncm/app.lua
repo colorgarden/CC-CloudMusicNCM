@@ -96,6 +96,7 @@ local currentTitle = ""
 
 local loginKey = nil
 local loginPolling = false
+local lastUserLabel = nil
 
 -- Playback state mirrored from speakerlib's events.  The UI reads and writes
 -- only this table; the speaker program itself runs in the background.
@@ -114,11 +115,6 @@ local player = {
 -- the next song is launched with the same id.
 local pendingLaunch = nil
 local launchSeq = 0
-
--- Login state, confirmed against the server with ncm.login_status.
-local loggedIn = false
-local loginStateKnown = false
-local userProfile = nil
 
 local GLYPH_H = 3
 
@@ -565,7 +561,12 @@ end
 -- ============================================================================
 
 local function requireLogin()
-  if loggedIn then return false end
+  local st = data.session or {}
+  if st.state == "in" then return false end
+  if st.state == "unknown" then
+    notify(S.network_error)
+    return true
+  end
   notify(S.need_login)
   return true
 end
@@ -654,53 +655,44 @@ end
 -- ============================================================================
 
 local function updateUserLabel()
+  local st = data.session or {}
   local label = S.login
-  if loggedIn then
-    if userProfile and userProfile.nickname then
-      label = userProfile.nickname
-    else
-      label = S.user
-    end
-  elseif data.cookie then
-    -- A cookie exists but has not been confirmed yet.
-    label = S.user
+  if st.state == "in" then
+    label = st.nickname or S.user
+  elseif st.state == "unknown" then
+    -- The cookie could not be verified: never render this as logged out.
+    label = st.nickname or S.user
   end
+  lastUserLabel = label
   userButton:setImage(bmp(label))
 end
 
--- Confirm the stored cookie with ncm.login_status.
---   no cookie                   -> logged out
---   cookie, server says invalid -> clear /ncm_cookie, show logged out
---   cookie, server says valid   -> logged in, refresh the user area
---   check could not run         -> keep the cookie, surface the error
+-- One-line startup diagnostic: cookie present? bytes? MUSIC_U? state + uid.
+local function loginDiagnostic()
+  local info = data.cookieInfo()
+  local st = data.session or {}
+  return string.format(
+    "login: cookie=%s bytes=%d MUSIC_U=%s state=%s uid=%s",
+    info.present and "yes" or "no",
+    info.bytes,
+    info.musicU and "yes" or "no",
+    tostring(st.state),
+    tostring(st.uid)
+  )
+end
+
+-- Re-resolve the session through the single data.session state.
+--   "in"      -> user area shows the nickname
+--   "out"     -> user area shows the login label
+--   "unknown" -> keep the cookie, surface the error, retry later
 local function refreshLoginState(opts)
   opts = opts or {}
-  if not data.cookie then
-    loggedIn = false
-    loginStateKnown = true
-    userProfile = nil
-    updateUserLabel()
-    return false
-  end
-  local st, err = data.loginStatus()
-  if not st then
-    if opts.notify then
-      notify(S.network_error .. ": " .. tostring(err), 4)
-    end
-    return nil
-  end
-  loginStateKnown = true
-  if st.loggedIn then
-    loggedIn = true
-    userProfile = st.profile
-    data.uid = st.uid
-  else
-    loggedIn = false
-    userProfile = nil
-    data.clearCookie()
-  end
+  local st, err = data.resolveSession()
   updateUserLabel()
-  return st.loggedIn
+  if opts.notify and st.state == "unknown" and err then
+    notify(S.network_error .. ": " .. tostring(err), 4)
+  end
+  return st.state
 end
 
 local function stopLoginPoll()
@@ -717,18 +709,19 @@ local function pollLogin()
   local code, cookie = data.qrCheck(loginKey)
   if code == 803 then
     stopLoginPoll()
-    if data.saveCookie(cookie) then
+    local saved, saveErr = data.saveCookie(cookie)
+    if saved then
       setLoginStatus(S.scan_success)
-      -- Do not trust the scan alone: re-check the account with login_status.
-      local verified = refreshLoginState()
-      if not verified then
+      -- Re-verify immediately, refresh nickname/uid, then close the panel.
+      refreshLoginState()
+      if (data.session or {}).state ~= "in" then
         -- The server can lag a moment behind the confirmation; retry briefly.
         after(1, function() refreshLoginState() end)
         after(2.5, function() refreshLoginState() end)
       end
       after(1.2, function() showFrame(loginFrame, false) end)
     else
-      setLoginStatus(S.scan_failed)
+      setLoginStatus(S.scan_failed .. ": " .. tostring(saveErr))
     end
     return
   elseif code == 800 then
@@ -800,26 +793,49 @@ end
 
 local function openLogout()
   data.logout()
-  loggedIn = false
-  loginStateKnown = true
-  userProfile = nil
   updateUserLabel()
   notify(S.logout)
 end
 
 -- Read-only accessors for the pages and the verification harness.
 function M.loginState()
+  local st = data.session or {}
+  local info = data.cookieInfo()
   return {
-    loggedIn = loggedIn,
-    known = loginStateKnown,
-    nickname = userProfile and userProfile.nickname,
-    uid = data.uid,
-    hasCookie = data.cookie ~= nil,
+    state = st.state,
+    loggedIn = st.state == "in",
+    nickname = st.nickname,
+    uid = st.uid,
+    hasCookie = info.present,
+    cookieBytes = info.bytes,
+    musicU = info.musicU,
   }
+end
+
+function M.loginDiagnostic()
+  return loginDiagnostic()
 end
 
 function M.refreshLoginState(opts)
   return refreshLoginState(opts)
+end
+
+-- Harness accessors: whether the QR overlay is shown / polling, the label text
+-- currently on the user button, and a way to open the QR panel like a click.
+function M.loginPanelVisible()
+  return loginFrame ~= nil and loginFrame.visible and true or false
+end
+
+function M.loginPolling()
+  return loginPolling and true or false
+end
+
+function M.userLabel()
+  return lastUserLabel
+end
+
+function M.startLogin()
+  startLogin()
 end
 
 -- ============================================================================
@@ -912,13 +928,14 @@ local function buildLayout()
   })
   userButton:setImage(bmp(S.login))
   userButton:onClick(function()
-    if loggedIn then
+    local st = data.session or {}
+    if st.state == "in" then
       openLogout()
-    elseif data.cookie then
-      -- Cookie present but not confirmed: retry the check instead of logging in
-      -- again (a network error must not silently look like "logged out").
+    elseif st.state == "unknown" then
+      -- Verification failed earlier: retry instead of logging in again.
       refreshLoginState({ notify = true })
     else
+      -- Confirmed logged out (or no cookie): the QR panel opens on request.
       openLogin()
     end
   end)
@@ -1052,18 +1069,26 @@ function M.build()
     return false, tostring(nerr)
   end
 
+  -- Resolve the session synchronously BEFORE the UI gates are built, so the
+  -- very first paint already knows whether the user is logged in (previously
+  -- the account was only checked ~0.3 s after the layout existed).
+  data.resolveSession()
+
   buildLayout()
   registerSpeakerEvents()
 
   basalt.onEvent("timer", onTimer)
   showPage(S.recommend_playlists, {})
   -- Load the default page once the UI is on screen, so a slow network never
-  -- delays the first paint.  The account check is deferred for the same reason:
-  -- it must not block boot when a cookie is present.
+  -- delays the first paint.
   after(0.2, function() switchPage("home") end)
-  -- Verify any stored cookie against the server instead of trusting its mere
-  -- presence, and report a network failure rather than showing "logged out".
-  after(0.3, function() refreshLoginState({ notify = true }) end)
+
+  -- One-line startup login diagnostic, routed through the log/notify path.
+  local diag = loginDiagnostic()
+  if basalt.LOGGER and type(basalt.LOGGER.info) == "function" then
+    pcall(basalt.LOGGER.info, diag)
+  end
+  notify(diag, 6)
   return true
 end
 

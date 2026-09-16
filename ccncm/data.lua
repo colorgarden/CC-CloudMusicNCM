@@ -13,6 +13,10 @@ local ncm = nil
 M.available = false
 M.reason = nil
 
+-- Single source of truth for the login state every UI gate reads:
+--   { state = "in" | "out" | "unknown", uid = ..., nickname = ... }
+M.session = { state = "unknown", uid = nil, nickname = nil }
+
 -- The speaker program lives next to ncm's dependencies.  ncm.lib resolves that
 -- directory at runtime; fall back to the documented install path.
 local SPEAKER_PROGRAM = "/ncm/lib/speaker.lua"
@@ -52,6 +56,38 @@ end
 -- Cookie persistence
 -- ============================================================================
 
+-- Set-Cookie attributes: never part of the cookie header that is sent back.
+local COOKIE_ATTRS = {
+  Expires = true,
+  ["Max-Age"] = true,
+  Path = true,
+  Domain = true,
+  Secure = true,
+  HttpOnly = true,
+  SameSite = true,
+  Version = true,
+  Comment = true,
+  Priority = true,
+}
+
+-- Keep only `name=value` cookie pairs.  The QR check responses include the
+-- whole Set-Cookie line (Path/Expires/Max-Age x many), which bloats the saved
+-- file and is not needed by the API.  MUSIC_U and __csrf are ordinary pairs and
+-- survive; bare attribute tokens (Secure/HttpOnly) are dropped too.
+function M.sanitizeCookie(str)
+  if type(str) ~= "string" then return nil end
+  local parts = {}
+  for token in str:gmatch("[^;]+") do
+    local trimmed = token:gsub("^%s+", ""):gsub("%s+$", "")
+    if trimmed ~= "" then
+      local key = trimmed:match("^([^=]+)") or trimmed
+      key = key:gsub("^%s+", ""):gsub("%s+$", "")
+      if not COOKIE_ATTRS[key] then parts[#parts + 1] = trimmed end
+    end
+  end
+  return table.concat(parts, "; ")
+end
+
 function M.loadCookie()
   if not fs.exists(COOKIE_FILE) then return nil end
   local f = fs.open(COOKIE_FILE, "r")
@@ -62,12 +98,36 @@ function M.loadCookie()
   return nil
 end
 
+-- Write the (sanitised) cookie and prove the write actually landed: a silent
+-- zero-byte write previously cost the user a login.  Writes to a temp file and
+-- moves it into place, so a failed write can never clobber a good cookie.
+-- Returns ok, err.
 function M.saveCookie(str)
-  if type(str) ~= "string" or str == "" then return false end
-  local f = fs.open(COOKIE_FILE, "w")
-  if not f then return false end
-  f.write(str)
-  f.close()
+  str = M.sanitizeCookie(str)
+  if type(str) ~= "string" or str == "" then
+    return false, "empty cookie after sanitising"
+  end
+  local tmp = COOKIE_FILE .. ".tmp"
+  if fs.exists(tmp) then pcall(fs.delete, tmp) end
+  local f = fs.open(tmp, "w")
+  if not f then return false, "cannot open " .. tmp .. " for writing" end
+  local okW, errW = pcall(function() f.write(str) end)
+  local okC, errC = pcall(function() f.close() end)
+  if not okW then pcall(fs.delete, tmp); return false, "write failed: " .. tostring(errW) end
+  if not okC then pcall(fs.delete, tmp); return false, "close failed: " .. tostring(errC) end
+
+  local size = fs.exists(tmp) and (fs.getSize(tmp) or 0) or 0
+  if size <= 0 then pcall(fs.delete, tmp); return false, "cookie file is empty after write" end
+  local rf = fs.open(tmp, "r")
+  if not rf then pcall(fs.delete, tmp); return false, "cannot reopen " .. tmp end
+  local back = rf.readAll()
+  rf.close()
+  if back ~= str then pcall(fs.delete, tmp); return false, "cookie read-back mismatch" end
+
+  if fs.exists(COOKIE_FILE) then pcall(fs.delete, COOKIE_FILE) end
+  local okM, errM = pcall(fs.move, tmp, COOKIE_FILE)
+  if not okM then pcall(fs.delete, tmp); return false, "move failed: " .. tostring(errM) end
+
   M.cookie = str
   return true
 end
@@ -75,7 +135,17 @@ end
 function M.clearCookie()
   M.cookie = nil
   M.uid = nil
+  M.session = { state = "out", uid = nil, nickname = nil }
   if fs.exists(COOKIE_FILE) then pcall(fs.delete, COOKIE_FILE) end
+end
+
+-- Facts for the startup diagnostic line.
+function M.cookieInfo()
+  local bytes = 0
+  if fs.exists(COOKIE_FILE) then bytes = fs.getSize(COOKIE_FILE) or 0 end
+  local present = type(M.cookie) == "string" and M.cookie ~= ""
+  local musicU = present and (M.cookie:find("MUSIC_U", 1, true) ~= nil) or false
+  return { present = present, bytes = bytes, musicU = musicU }
 end
 
 -- ============================================================================
@@ -231,6 +301,42 @@ function M.logout()
     pcall(ncm.logout, { cookie = M.cookie })
   end
   M.clearCookie()
+end
+
+-- Resolve and store the one session state every UI gate reads.  Three-way and
+-- never conflated:
+--   no cookie                          -> "out"
+--   verification succeeded, account    -> "in"
+--   verification FAILED (raise/timeout)-> "unknown" (cookie kept!)
+--   verification succeeded, no account -> "out" (definitive; cookie cleared)
+function M.resolveSession()
+  if not ncm then
+    M.session = { state = "unknown", uid = M.session.uid, nickname = M.session.nickname }
+    return M.session, "ncm unavailable"
+  end
+  if type(M.cookie) ~= "string" or M.cookie == "" then
+    M.session = { state = "out", uid = nil, nickname = nil }
+    return M.session
+  end
+  local st, err = M.loginStatus()
+  if not st then
+    -- The check itself could not run: keep the cookie and stay "unknown" so the
+    -- UI never renders the user as logged out because of a network hiccup.
+    M.session = { state = "unknown", uid = M.session.uid, nickname = M.session.nickname }
+    return M.session, err
+  end
+  if st.loggedIn then
+    M.session = {
+      state = "in",
+      uid = st.uid,
+      nickname = (st.profile and st.profile.nickname) or nil,
+    }
+    return M.session
+  end
+  -- A successful call that reports no account is a definitive "out".
+  M.clearCookie()
+  M.session = { state = "out", uid = nil, nickname = nil }
+  return M.session
 end
 
 -- ============================================================================
