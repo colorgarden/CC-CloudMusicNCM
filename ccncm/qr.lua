@@ -123,7 +123,7 @@ function M.toBimg(text, opts)
 
   local rows = {}
   for y = 1, h, 3 do
-    local text, fg, bg = {}, {}, {}
+    local cells, fg, bg = {}, {}, {}
     local n = 0
     for x = 1, w, 2 do
       local t = {
@@ -142,11 +142,11 @@ function M.toBimg(text, opts)
         glyph, s1, s2 = calculateTexel(t)
       end
       n = n + 1
-      text[n] = glyph
+      cells[n] = glyph
       fg[n] = s1 == 1 and "Q" or "B"
       bg[n] = s2 == 1 and "Q" or "B"
     end
-    rows[#rows + 1] = { table.concat(text), table.concat(fg), table.concat(bg) }
+    rows[#rows + 1] = { table.concat(cells), table.concat(fg), table.concat(bg) }
   end
 
   return { rows }

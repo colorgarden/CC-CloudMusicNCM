@@ -11,6 +11,13 @@
 
 package.path = "/?.lua;/?/init.lua;" .. package.path
 
+-- A font/terminal failure can surface a Chinese error string (e.g. from
+-- utf8display).  Without a CJK font that would render as garbage, so the
+-- diagnostic must be forced back to ASCII.
+local function asciiSafe(text)
+  return (tostring(text or ""):gsub("[\128-\255]", "?"))
+end
+
 local function fail(msg)
   pcall(function()
     term.setBackgroundColor(colors.black)
@@ -19,7 +26,7 @@ local function fail(msg)
     term.setCursorPos(1, 1)
   end)
   print("CC-CloudMusicNCM - cannot start")
-  print(tostring(msg))
+  print(asciiSafe(msg))
   print("")
   print("Prerequisites:")
   print("  - Advanced computer with HTTP enabled")
@@ -69,8 +76,20 @@ if built == false or built == nil then
   return
 end
 
--- app.run() blocks in Basalt's event loop until the user stops it.
+-- app.run() blocks in Basalt's event loop until the user stops it (Ctrl+T
+-- makes Basalt.stop() clear the terminal it was drawing on).  If we redirected
+-- the terminal to a monitor, hand it back to the computer afterwards so the
+-- shell prompt does not stay stranded on the monitor.
 local okRun, runErr = pcall(app.run)
+if monitor then
+  pcall(function() term.redirect(term.native()) end)
+end
+pcall(function()
+  term.setBackgroundColor(colors.black)
+  term.setTextColor(colors.white)
+  term.clear()
+  term.setCursorPos(1, 1)
+end)
 if not okRun then
   fail(runErr)
 end

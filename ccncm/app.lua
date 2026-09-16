@@ -63,11 +63,15 @@ end
 -- terminal while it runs, so after it returns we must mark the whole screen
 -- dirty or most of the UI would stay blank.
 local function forceFullRedraw()
-  if not root then return end
-  local r = root._render
+  -- Resolve the live frame explicitly: `root` is declared further down, so
+  -- referring to it here would capture the (nil) global instead and silently
+  -- skip the redraw.
+  local frame = basalt.getMainFrame()
+  if not frame then return end
+  local r = frame._render
   if r and r.addDirtyRect then
-    r:addDirtyRect(1, 1, root:getWidth(), root:getHeight())
-    root._renderUpdate = true
+    r:addDirtyRect(1, 1, frame:getWidth(), frame:getHeight())
+    frame._renderUpdate = true
   end
 end
 
@@ -105,14 +109,6 @@ local function after(seconds, fn)
   return id
 end
 
-local function onTimer(id)
-  local fn = timerHandlers[id]
-  if fn then
-    timerHandlers[id] = nil
-    fn()
-  end
-end
-
 -- ============================================================================
 -- Notifications
 -- ============================================================================
@@ -135,6 +131,24 @@ local function notify(bimgOrText, seconds)
   after(seconds or 2.5, function()
     showFrame(popupFrame, false)
   end)
+end
+
+-- ============================================================================
+-- Timer dispatch
+-- ============================================================================
+
+-- A user callback must not take the event loop down.  Basalt pcall-wraps its
+-- own frame dispatch, but a callback registered with basalt.onEvent runs
+-- unprotected, so an error here would abort the rest of that event.  Catch it
+-- and surface it instead of failing silently.
+local function onTimer(id)
+  local fn = timerHandlers[id]
+  if not fn then return end
+  timerHandlers[id] = nil
+  local ok, err = pcall(fn)
+  if not ok then
+    pcall(notify, "timer: " .. tostring(err), 4)
+  end
 end
 
 -- ============================================================================
