@@ -7,10 +7,10 @@
        offers to download and run the library installer through the ghproxy
        mirror and, once /ncm/init.lua exists, continues automatically,
     2. removes any previous /ccncm install,
-    3. checks free disk space,
-    4. streams dist/ccncm.tar off the internet straight into the filesystem
-       (uncompressed USTAR - no gzip library or temp file needed),
-    5. verifies the files that the client's startup.lua requires.
+    3. downloads dist/ccncm.tar fully into memory, measures what it needs,
+       checks free disk space against that measured figure, and only then
+       extracts it (uncompressed USTAR - no gzip library or temp file needed),
+    4. verifies the files that the client's startup.lua requires.
 
   Layout (the bundle's entries are already rooted at `ccncm/`):
 
@@ -48,10 +48,6 @@ local CONFIG = {
   root = "/",
   -- Bundle path relative to the base URL.
   bundle = "dist/ccncm.tar",
-  -- Rough size of the extracted client plus file-system slack. The client is
-  -- about 425 KB with Basalt; leave room so "Out of space" cannot happen deep
-  -- inside the extractor, where it would be impossible to act on.
-  needBytes = 600000,
 }
 
 local args = { ... }
@@ -128,26 +124,15 @@ local function plainGet(url)
   return nil, lastErr
 end
 
-local function readN(handle, n)
-  local out, got = {}, 0
-  while got < n do
-    local chunk = handle.read(n - got)
-    if not chunk or #chunk == 0 then break end
-    out[#out + 1] = chunk
-    got = got + #chunk
-  end
-  return table.concat(out), got
-end
-
--- Wrap a binary HTTP handle so `read(n)` behaves the way the extractor below
+-- Wrap a binary HTTP handle so `read(n)` behaves the way readBody() above
 -- expects: blocking, returning nil only at end of stream.
 --
 -- CC:Tweaked's http handle already does this. CraftOS-PC does not: there
 -- `read(n)` is a non-blocking readsome() that can return "" while the body is
--- still downloading, so the reference extractor would stop at the first header
--- and extract nothing. On the first empty read we fall back to readAll(), which
--- blocks until the whole (small, ~486 KB) response is buffered, and then serve
--- the remaining reads from memory. Real hardware keeps true streaming.
+-- still downloading, so a plain read loop would stop at the first header and
+-- buffer nothing. On the first empty read we fall back to readAll(), which
+-- blocks until the whole (small, ~450 KB) response is buffered, and then serve
+-- the remaining reads from memory.
 local function blockingHandle(handle)
   local body, pos = nil, 1
   return {
@@ -170,38 +155,81 @@ local function blockingHandle(handle)
   }
 end
 
--- Stream a (uncompressed) USTAR archive from an HTTP handle into `root`.
-local function untar(handle, root)
-  local count = 0
+-- Read the whole (small, single-response) body into one Lua string before
+-- measuring or extracting it. blockingHandle() makes read(n) blocking, so this
+-- loop terminates only at end of stream, and the archive never touches disk.
+local function readBody(handle)
+  local h = blockingHandle(handle)
+  local out = {}
   while true do
-    local hdr, n = readN(handle, 512)
-    if n < 512 then break end
-    local name = hdr:sub(1, 100):match("^[^%z]*") or ""
-    if name == "" then break end -- end-of-archive
-    local sizeStr = (hdr:sub(125, 136):match("^[^%z]*") or "0"):gsub("%s", "")
-    local size = tonumber(sizeStr, 8) or 0
-    local typeflag = hdr:sub(157, 157)
-    local prefix = hdr:sub(346, 500):match("^[^%z]*") or ""
-    local full = prefix ~= "" and (prefix .. "/" .. name) or name
-    local dest = root .. full
+    local chunk = h.read(65536)
+    if not chunk or #chunk == 0 then break end
+    out[#out + 1] = chunk
+  end
+  return table.concat(out)
+end
 
+-- CC:Tweaked charges every file its contents plus the length of its path (and a
+-- little metadata), which the USTAR size fields do not include. This is a
+-- per-entry allowance for that bookkeeping, NOT a size threshold: the byte
+-- total itself is measured from the archive by measureTar(), never guessed.
+local PER_ENTRY_OVERHEAD = 64
+
+-- Decode the USTAR header fields the walks below need. A header is 512 bytes:
+--   name     bytes   0.. 99
+--   size     bytes 124..135  (11 octal digits followed by a NUL)
+--   typeflag byte  156
+--   prefix   bytes 345..499
+-- All offsets above are 0-based; the sub() indices here are 1-based.
+local function tarHeader(hdr)
+  local name = hdr:sub(1, 100):match("^[^%z]*") or ""
+  local size = tonumber((hdr:sub(125, 136):match("^[^%z]*") or "0"):gsub("%s", ""), 8) or 0
+  local typeflag = hdr:sub(157, 157)
+  local prefix = hdr:sub(346, 500):match("^[^%z]*") or ""
+  local full = prefix ~= "" and (prefix .. "/" .. name) or name
+  return name, full, size, typeflag
+end
+
+-- Pass 1: measure an in-memory USTAR archive without writing anything.
+--
+-- USTAR stores each entry as a fixed 512-byte header block followed by its data
+-- rounded up to a 512-byte boundary. This walks those blocks and sums the
+-- declared sizes; the 512-byte headers and padding are skipped (they are the
+-- container, not the payload). Every entry is counted too - including
+-- directories - so the caller can add PER_ENTRY_OVERHEAD per entry.
+local function measureTar(body)
+  local total, entries, pos = 0, 0, 1
+  while pos + 511 <= #body do
+    local hdr = body:sub(pos, pos + 511)
+    local name, _, size = tarHeader(hdr)
+    if name == "" then break end -- end-of-archive marker
+    total = total + size
+    entries = entries + 1
+    pos = pos + 512 + math.ceil(size / 512) * 512
+  end
+  return total, entries
+end
+
+-- Pass 2: extract an in-memory USTAR archive under `root`. This is the same
+-- walk measureTar() uses, and it runs only after the free-space check passes,
+-- so nothing is written before the check.
+local function extractTar(body, root)
+  local count, pos = 0, 1
+  while pos + 511 <= #body do
+    local hdr = body:sub(pos, pos + 511)
+    local name, full, size, typeflag = tarHeader(hdr)
+    if name == "" then break end -- end-of-archive marker
+    pos = pos + 512
     if typeflag == "5" then
-      mkdirp(dest:gsub("/+$", ""))
+      mkdirp((root .. full):gsub("/+$", ""))
     else
-      mkdirp(dirname(dest))
-      local f = assert(fs.open(dest, "wb"))
-      local remaining = size
-      while remaining > 0 do
-        local chunk = readN(handle, math.min(remaining, 8192))
-        if #chunk == 0 then break end
-        f.write(chunk)
-        remaining = remaining - #chunk
-      end
+      mkdirp(dirname(root .. full))
+      local f = assert(fs.open(root .. full, "wb"))
+      f.write(body:sub(pos, pos + size - 1))
       f.close()
-      local pad = (512 - (size % 512)) % 512
-      if pad > 0 then readN(handle, pad) end
       count = count + 1
     end
+    pos = pos + math.ceil(size / 512) * 512
   end
   return count
 end
@@ -320,29 +348,16 @@ log("  target : %s/", target)
 log("[1/4] Removing previous install (if any) ...")
 rmrf(target)
 
--- 2. check free space before touching the bundle.
-log("[2/4] Checking free space ...")
-if fs.getFreeSpace then
-  local free = fs.getFreeSpace(root)
-  log("  free space: %d bytes", free)
-  if free < CONFIG.needBytes then
-    die(string.format(
-      "not enough disk space: %d bytes free, about %d needed.\n"
-        .. "  Delete files on the computer, or raise computer_space_limit in\n"
-        .. "  config/computercraft-server.toml (then restart the world), and retry.",
-      free, CONFIG.needBytes))
-  end
-else
-  log("  free-space check unavailable on this build, continuing")
-end
-
--- 3. download + extract, falling through mirrors until a bundle verifies.
+-- 2. download each candidate bundle into memory, measure the archive that was
+-- just downloaded, check that it fits, and only then extract it. The size MUST
+-- come from the archive itself: a hardcoded byte count goes stale as soon as
+-- the bundle changes, and it cannot account for CC charging disk per file.
 local sources = { CONFIG.base }
 for _, m in ipairs(MIRRORS) do
   if m.base ~= CONFIG.base then sources[#sources + 1] = m.base end
 end
 
-log("[3/4] Downloading and extracting ...")
+log("[2/3] Downloading and extracting ...")
 local installed = false
 for i = 1, #sources do
   local base = sources[i]
@@ -352,8 +367,28 @@ for i = 1, #sources do
   if not handle then
     log("  download failed: %s", tostring(err))
   else
-    local files = untar(blockingHandle(handle), root)
+    -- Buffer the whole archive, then measure it BEFORE writing a single byte.
+    local body = readBody(handle)
     handle.close()
+
+    local totalBytes, entries = measureTar(body)
+    local needed = totalBytes + entries * PER_ENTRY_OVERHEAD
+    log("  archive: %d entries, %d bytes (needs about %d with per-file overhead)",
+      entries, totalBytes, needed)
+
+    if fs.getFreeSpace then
+      local free = fs.getFreeSpace(root)
+      log("  free space: %d bytes", free)
+      if free < needed then
+        die(string.format(
+          "not enough disk space: %d bytes free, this archive needs about %d bytes (%d entries).\n"
+            .. "  Delete files on the computer, or raise computer_space_limit in\n"
+            .. "  config/computercraft-server.toml (then restart the world), and retry.",
+          free, needed, entries))
+      end
+    end
+
+    local files = extractTar(body, root)
     log("  extracted %d files", files)
 
     if fs.exists(target .. "/startup.lua")
@@ -372,8 +407,8 @@ if not installed then
   die("could not install a complete bundle from any mirror")
 end
 
--- 4. verify the files startup.lua loads and print the run instruction.
-log("[4/4] Verifying ...")
+-- 3. verify the files startup.lua loads and print the run instruction.
+log("[3/3] Verifying ...")
 local checks = {
   "startup.lua",
   "Lib/basalt.lua",
