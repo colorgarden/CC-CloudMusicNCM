@@ -221,8 +221,11 @@ end
 -- the cursor on the bar's own row for the next print.
 local function finishProgress()
   if progressRow then
-    term.setCursorPos(1, progressRow)
-    term.clearLine()
+    -- Keep the completed bar on screen (a fast connection throttles the
+    -- intermediate frames away) and move past it so the next log line does
+    -- not overwrite it from column 1.
+    local _, h = term.getSize()
+    term.setCursorPos(1, math.min(progressRow + 1, h))
   end
   lastDraw, lastLabel, progressRow = 0, nil, nil
 end
