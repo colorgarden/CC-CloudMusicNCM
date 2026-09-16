@@ -151,3 +151,27 @@ cookie → 播放”这段依赖手机扫码和扬声器/转码服务,未在纯 
   (GPL-2.0),其来源注明为 GMapiServer 的 `qr_bimg_utils.py`;二维码本身的
   编码由 `ncm.util.qrcode.encode` 完成,本项目未自行实现编码器。
 - **`icons/*.lua`**:本项目自带的图标资源。
+
+---
+
+## 依赖与许可
+
+本仓库以 **GPL-2.0** 发布(见 LICENSE)。
+
+| 组件 | 用途 | 许可 | 说明 |
+|---|---|---|---|
+| [Basalt](https://github.com/Pyroxenium/Basalt2) | UI 框架(Lib/basalt.lua) | 见文件头 | 第三方,未改动 |
+| [ComputerCraft-Utf8](https://git.liulikeji.cn/xingluo/ComputerCraft-Utf8) | 中文像素渲染(Lib/utf8display.lua,含字体管理器) | **上游未声明任何许可证** | 仓库无 LICENSE 文件、README 无声明;按现状使用并署名 |
+| [fusion-pixel-font](https://github.com/TakWolf/fusion-pixel-font) | 像素字体(中/日/韩/拉丁,8px 与 12px) | **SIL Open Font License 1.1 (OFL-1.1)** | 来自 ComputerCraft-Utf8 的 fonts/;OFL 要求署名并随附许可声明 |
+| [rxi/json.lua](https://github.com/rxi/json.lua) | JSON 编解码(Lib/json.lua) | MIT (c) 2020 rxi | 见 Lib/json.lua.LICENSE |
+| icons/*.lua | 图标点阵 | 本项目资产 | 自绘 |
+
+### 字体依赖(重要)
+
+单个字体文件 **1.68 MB(8px)/ 4.04 MB(12px)**,**超过 CC 电脑 1 MB 的磁盘上限**,因此
+Lib/utf8display.lua 默认**从网络加载字体**(默认即上游 fonts/fusion-pixel-8px-proportional-zh_hans.lua)。
+后果:
+
+- 服务器白名单必须放行字体所在主机(默认 git.liulikeji.cn),否则中文全部显示为占位符;
+- 加载一份 8px 字体约占用 **6 MB 内存**,12px 约 **10.5 MB**(上游 README 数据);
+- 无法用"字体子集化"绕开:界面固定文案可以子集化,但**搜索结果的歌名是任意中文**,必须完整 CJK 字形表。
