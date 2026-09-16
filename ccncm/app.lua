@@ -93,6 +93,7 @@ local currentIndex = 0
 local history = {}
 local currentItems = {}
 local currentTitle = ""
+local currentPageKey = nil
 
 local loginKey = nil
 local loginPolling = false
@@ -134,7 +135,12 @@ end
 
 local function notify(bimgOrText, seconds)
   local b = bimgOrText
-  if type(b) == "string" then b = bmp(b) end
+  if type(b) == "string" then
+    -- The monitor exists only to show the UI; every notification-backed message
+    -- (errors included) is mirrored to the computer's own terminal as a log.
+    pcall(data.printNative, "notice: " .. b)
+    b = bmp(b)
+  end
   if type(b) ~= "table" then return end
   local w = bimg.widthOf(b)
   local pw = math.min(w + 2, root:getWidth() - 2)
@@ -150,6 +156,26 @@ local function notify(bimgOrText, seconds)
   after(seconds or 2.5, function()
     showFrame(popupFrame, false)
   end)
+end
+
+-- Basalt's own LOGGER writes through the current terminal, which is the monitor
+-- once the UI is redirected.  Wrap the human-facing levels so their output is
+-- also written to the computer's own terminal.
+local loggerRouted = false
+local function routeLoggerToNative(logger)
+  if loggerRouted or type(logger) ~= "table" then return end
+  loggerRouted = true
+  for _, level in ipairs({ "info", "warn", "error" }) do
+    local orig = logger[level]
+    if type(orig) == "function" then
+      logger[level] = function(...)
+        local parts = {}
+        for i = 1, select("#", ...) do parts[i] = tostring((select(i, ...))) end
+        pcall(data.printNative, "basalt." .. level .. ": " .. table.concat(parts, " "))
+        return orig(...)
+      end
+    end
+  end
 end
 
 -- ============================================================================
@@ -647,7 +673,10 @@ end
 
 local function switchPage(key)
   local fn = PAGES[key]
-  if fn then fn() end
+  if fn then
+    currentPageKey = key
+    fn()
+  end
 end
 
 -- ============================================================================
@@ -687,7 +716,7 @@ end
 --   "unknown" -> keep the cookie, surface the error, retry later
 local function refreshLoginState(opts)
   opts = opts or {}
-  local st, err = data.resolveSession()
+  local st, err = data.resolveSession({ pending = opts.pending })
   updateUserLabel()
   if opts.notify and st.state == "unknown" and err then
     notify(S.network_error .. ": " .. tostring(err), 4)
@@ -695,13 +724,61 @@ local function refreshLoginState(opts)
   return st.state
 end
 
+-- After a confirmed login the session data is live; if the visible page was one
+-- gated behind the login, re-run it so its content appears without a manual
+-- click.  updateUserLabel() redraws the user area in every case.
+local function refreshAfterLogin()
+  updateUserLabel()
+  if (currentPageKey == "like" or currentPageKey == "favorite") and PAGES[currentPageKey] then
+    local fn = PAGES[currentPageKey]
+    pcall(fn)
+  end
+end
+
 local function stopLoginPoll()
   loginPolling = false
   loginKey = nil
 end
 
+local lastLoginStatus = nil
 local function setLoginStatus(text)
+  lastLoginStatus = text
   loginStatus:setImage(bmp(text))
+end
+
+-- The server can lag a few seconds behind the 803 confirmation, so a 200 that
+-- still reports "no account" is inconclusive, not a logout.  Retry every 1.5 s
+-- (bounded to ~15 s) and never settle on "out": the cookie stays on disk the
+-- whole time and the state stays "unknown" until it is truly verified.
+local verifyAttempts = 0
+local verifyLoginTick
+verifyLoginTick = function()
+  verifyAttempts = verifyAttempts + 1
+  local state = refreshLoginState({ pending = true })
+  if state == "in" then
+    local st = data.session or {}
+    setLoginStatus(S.scan_success)
+    data.printNative(string.format(
+      "login: verified, state=in uid=%s nickname=%s",
+      tostring(st.uid), tostring(st.nickname)))
+    refreshAfterLogin()
+    after(1.2, function() showFrame(loginFrame, false) end)
+    return
+  end
+  if verifyAttempts < 10 then
+    setLoginStatus(S.scan_verifying)
+    after(1.5, verifyLoginTick)
+  else
+    -- Keep the cookie and the "unknown" state; the user may press refresh.
+    setLoginStatus(S.network_error)
+  end
+end
+
+local function beginLoginVerification()
+  verifyAttempts = 0
+  setLoginStatus(S.scan_verifying)
+  data.printNative("login: QR confirmed, verifying session...")
+  verifyLoginTick()
 end
 
 local function pollLogin()
@@ -712,14 +789,11 @@ local function pollLogin()
     local saved, saveErr = data.saveCookie(cookie)
     if saved then
       setLoginStatus(S.scan_success)
-      -- Re-verify immediately, refresh nickname/uid, then close the panel.
-      refreshLoginState()
-      if (data.session or {}).state ~= "in" then
-        -- The server can lag a moment behind the confirmation; retry briefly.
-        after(1, function() refreshLoginState() end)
-        after(2.5, function() refreshLoginState() end)
-      end
-      after(1.2, function() showFrame(loginFrame, false) end)
+      -- The same refresh the startup path runs: saveCookie -> refreshLoginState
+      -- -> updateUserLabel, plus the session state and any gated page.  It keeps
+      -- retrying until the endpoint catches up, instead of trusting the first
+      -- (possibly stale) answer.
+      beginLoginVerification()
     else
       setLoginStatus(S.scan_failed .. ": " .. tostring(saveErr))
     end
@@ -824,6 +898,10 @@ end
 -- currently on the user button, and a way to open the QR panel like a click.
 function M.loginPanelVisible()
   return loginFrame ~= nil and loginFrame.visible and true or false
+end
+
+function M.loginStatusText()
+  return lastLoginStatus
 end
 
 function M.loginPolling()
@@ -1069,12 +1147,22 @@ function M.build()
     return false, tostring(nerr)
   end
 
+  -- Surface (on the computer terminal, never the monitor) the one case where
+  -- several speakers cannot be synchronised on this CC:Tweaked build, instead
+  -- of leaving the user with silent multi-speaker drift later.
+  local syncNote = data.speakerSyncNote and data.speakerSyncNote()
+  if syncNote then data.printNative("speaker: " .. syncNote) end
+
   -- Resolve the session synchronously BEFORE the UI gates are built, so the
   -- very first paint already knows whether the user is logged in (previously
   -- the account was only checked ~0.3 s after the layout existed).
   data.resolveSession()
 
   buildLayout()
+  -- The user label is derived from the resolved session, so it must be applied
+  -- once the button exists.  Without this the button stays on the "login" label
+  -- even though data.session is already "in".
+  updateUserLabel()
   registerSpeakerEvents()
 
   basalt.onEvent("timer", onTimer)
@@ -1083,12 +1171,11 @@ function M.build()
   -- delays the first paint.
   after(0.2, function() switchPage("home") end)
 
-  -- One-line startup login diagnostic, routed through the log/notify path.
-  local diag = loginDiagnostic()
-  if basalt.LOGGER and type(basalt.LOGGER.info) == "function" then
-    pcall(basalt.LOGGER.info, diag)
-  end
-  notify(diag, 6)
+  -- One-line startup login diagnostic.  It is a log, not a UI element: it is
+  -- written to the computer's own terminal (never the monitor) and Basalt's own
+  -- logger is re-routed there too.
+  routeLoggerToNative(basalt.LOGGER)
+  data.printNative(loginDiagnostic())
   return true
 end
 

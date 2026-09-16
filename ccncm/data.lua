@@ -7,6 +7,32 @@
 
 local M = {}
 
+-- ============================================================================
+-- Native-terminal logging
+-- ============================================================================
+
+-- The UI is drawn on an attached monitor via term.redirect(monitor), but every
+-- diagnostic must stay on the computer's own terminal.  printNative() saves the
+-- current redirection, writes the line through term.native(), then restores the
+-- redirection, so it is safe to call from the Basalt event loop, timers and
+-- startup alike.  Extra arguments are space-separated like print().
+function M.printNative(...)
+  local parts = {}
+  for i = 1, select("#", ...) do
+    parts[i] = tostring((select(i, ...)))
+  end
+  local line = table.concat(parts, "\t")
+  local previous = term.current()
+  local ok = pcall(function()
+    term.redirect(term.native())
+    pcall(term.setTextColor, colors.white)
+    pcall(term.setBackgroundColor, colors.black)
+    print(line)
+  end)
+  pcall(term.redirect, previous)
+  return ok
+end
+
 local COOKIE_FILE = "/ncm_cookie"
 
 local ncm = nil
@@ -197,11 +223,69 @@ function M.speakerProgram()
   return SPEAKER_PROGRAM
 end
 
-function M.hasSpeaker()
-  if peripheral and peripheral.find then
-    return peripheral.find("speaker") ~= nil
+-- Every attached speaker peripheral, by name, in peripheral order.
+-- peripheral.find("speaker") returns only the first one; speakerlib, left to
+-- auto-detect, splits speakers named left/right into separate voice groups and
+-- then writes each group in turn (sequential), which is what makes multiple
+-- speakers drift.  Enumerating every name lets runSpeaker hand speakerlib ONE
+-- group so a single write covers them all.
+function M.speakerNames()
+  local names = {}
+  if peripheral and type(peripheral.getNames) == "function" then
+    local ok, all = pcall(peripheral.getNames)
+    if ok and type(all) == "table" then
+      for i = 1, #all do
+        local name = all[i]
+        local isSpeaker = false
+        if type(peripheral.hasType) == "function" then
+          local okT, t = pcall(peripheral.hasType, name, "speaker")
+          isSpeaker = okT and t == true
+        elseif type(peripheral.getType) == "function" then
+          local okT, t = pcall(peripheral.getType, name)
+          isSpeaker = okT and t == "speaker"
+        end
+        if isSpeaker then names[#names + 1] = name end
+      end
+    end
   end
-  return false
+
+  -- Fallback for hosts/tests without peripheral.getNames: the single speaker
+  -- returned by find(), named via peripheral.getName() or a .name field.
+  if #names == 0 and peripheral and type(peripheral.find) == "function" then
+    local ok, sp = pcall(peripheral.find, "speaker")
+    if ok and type(sp) == "table" then
+      local name
+      if type(sp.name) == "string" then
+        name = sp.name
+      elseif type(peripheral.getName) == "function" then
+        local okN, n = pcall(peripheral.getName, sp)
+        if okN and type(n) == "string" then name = n end
+      end
+      if name then names[1] = name end
+    end
+  end
+  return names
+end
+
+function M.hasSpeaker()
+  return #M.speakerNames() > 0
+end
+
+-- speakerlib reaches its synchronised speaker.playAudioEx write path only when
+-- the peripheral exposes playAudioEx (newer CC:Tweaked / CC Audio Expand).
+-- Without it the write degrades to a best-effort parallel playAudio.  Return
+-- one ASCII line describing the limitation when several speakers are attached
+-- and playAudioEx is absent, so the user is not left with silent drift; nil
+-- when synchronised playback is available or only one speaker is attached.
+function M.speakerSyncNote()
+  if #M.speakerNames() <= 1 then return nil end
+  local sp
+  if peripheral and type(peripheral.find) == "function" then
+    local ok, found = pcall(peripheral.find, "speaker")
+    if ok then sp = found end
+  end
+  if type(sp) == "table" and type(sp.playAudioEx) == "function" then return nil end
+  return "multi-speaker sync unavailable on this CC:Tweaked build; use one speaker"
 end
 
 -- ============================================================================
@@ -309,7 +393,15 @@ end
 --   verification succeeded, account    -> "in"
 --   verification FAILED (raise/timeout)-> "unknown" (cookie kept!)
 --   verification succeeded, no account -> "out" (definitive; cookie cleared)
-function M.resolveSession()
+--
+-- opts.pending = true is used right after a QR confirmation: the account
+-- endpoint can lag a few seconds behind the 803, so a 200 that reports no
+-- account is *inconclusive*, not logged out.  In that mode the cookie is kept
+-- and the state stays "unknown" so a retry loop can finish the verification.
+-- Without opts.pending the historical behaviour is unchanged (a definitive
+-- logged-out answer clears the cookie).
+function M.resolveSession(opts)
+  opts = opts or {}
   if not ncm then
     M.session = { state = "unknown", uid = M.session.uid, nickname = M.session.nickname }
     return M.session, "ncm unavailable"
@@ -332,6 +424,11 @@ function M.resolveSession()
       nickname = (st.profile and st.profile.nickname) or nil,
     }
     return M.session
+  end
+  if opts.pending then
+    -- Inconclusive: keep the cookie and the last known identity, never "out".
+    M.session = { state = "unknown", uid = M.session.uid, nickname = M.session.nickname }
+    return M.session, "not verified yet"
   end
   -- A successful call that reports no account is a definitive "out".
   M.clearCookie()
@@ -487,16 +584,34 @@ end
 -- Run the speaker program for `url`.  This blocks the *calling coroutine* until
 -- playback ends, so the UI must call it through basalt.schedule(), which pumps
 -- the coroutine with the Basalt event loop and keeps the UI responsive.
---   -noui  speakerlib never paints its own page over the client.
---   -id    every speakerlib_* event carries this client's id.
+--   -noui    speakerlib never paints its own page over the client.
+--   -id      every speakerlib_* event carries this client's id.
+--   -speaker every detected speaker as ONE main group, so speakerlib makes a
+--            single (concurrent) write instead of sequential per-group writes.
+-- shell.execute() delivers the JSON group verbatim; shell.run() re-tokenises
+-- its arguments and would tear the JSON apart on its quotes.
 function M.runSpeaker(url)
   if not fs.exists(SPEAKER_PROGRAM) then
     return false, "speaker program missing: " .. SPEAKER_PROGRAM
   end
-  if not M.hasSpeaker() then
+  local names = M.speakerNames()
+  if #names == 0 then
     return false, "no speaker attached"
   end
-  local ok, res = pcall(shell.run, SPEAKER_PROGRAM, url, "-id", M.SPEAKER_ID, "-noui")
+
+  local note = M.speakerSyncNote()
+  if note then M.printNative("speaker: " .. note) end
+
+  local group = textutils.serializeJSON({ main = names })
+  local ok, res
+  if type(shell.execute) == "function" then
+    ok, res = pcall(shell.execute, SPEAKER_PROGRAM,
+      url, "-id", M.SPEAKER_ID, "-noui", "-speaker", group)
+  else
+    -- Very old shells lack execute(); fall back to the single find() result
+    -- (no JSON group, so it is still passed as plain arguments).
+    ok, res = pcall(shell.run, SPEAKER_PROGRAM, url, "-id", M.SPEAKER_ID, "-noui")
+  end
   if not ok then return false, tostring(res) end
   if res == false then return false, "speaker program exited with an error" end
   return true
