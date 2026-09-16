@@ -160,11 +160,11 @@ cookie → 播放”这段依赖手机扫码和扬声器/转码服务,未在纯 
 
 | 组件 | 用途 | 许可 | 说明 |
 |---|---|---|---|
-| [Basalt](https://github.com/Pyroxenium/Basalt2) | UI 框架(Lib/basalt.lua) | 见文件头 | 第三方,未改动 |
+| [Basalt](https://github.com/Pyroxenium/Basalt2) | UI 框架(`Lib/basalt.lua`) | **GPL-2.0** | 第三方,未改动;与本项目同协议,兼容 |
 | [ComputerCraft-Utf8](https://git.liulikeji.cn/xingluo/ComputerCraft-Utf8) | 中文像素渲染(Lib/utf8display.lua,含字体管理器) | **上游未声明任何许可证** | 仓库无 LICENSE 文件、README 无声明;按现状使用并署名 |
 | [fusion-pixel-font](https://github.com/TakWolf/fusion-pixel-font) | 像素字体(中/日/韩/拉丁,8px 与 12px) | **SIL Open Font License 1.1 (OFL-1.1)** | 来自 ComputerCraft-Utf8 的 fonts/;OFL 要求署名并随附许可声明 |
 | [rxi/json.lua](https://github.com/rxi/json.lua) | JSON 编解码(Lib/json.lua) | MIT (c) 2020 rxi | 见 Lib/json.lua.LICENSE |
-| icons/*.lua | 图标点阵 | 本项目资产 | 自绘 |
+| `icons/*.lua` | 图标点阵(31 个) | **GPL-2.0** | **并非本项目自绘**:来自参考客户端(与 ComputerCraft-Utf8 / liulikeji 项目同源) |
 
 ### 字体依赖(重要)
 
