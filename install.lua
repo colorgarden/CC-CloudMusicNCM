@@ -18,6 +18,14 @@
        only then extracts it (uncompressed USTAR - no gzip library or temp file),
     5. verifies the files that the client's startup.lua requires.
 
+  Failure reporting
+    Every step prints a start line before it runs. Every fatal path goes
+    through failStep(), which prints WHAT step failed, WHICH url/path it
+    involved, the EXACT error text (including any HTTP status the response
+    carried) and WHAT to try, then aborts. Mirrors are tried in turn and a
+    failure prints that mirror's url, its reason and "trying the next
+    mirror"; when every mirror fails one block lists each url and its error.
+
   Layout (the client bundle's entries are already rooted at `ccncm/`):
 
       /Lib/basalt.lua           shared Basalt UI framework (once, internal)
@@ -89,15 +97,120 @@ local BASALT_ENTRY = "Lib/basalt.lua"
 
 local args = { ... }
 
+-- --------------------------------------------------------------- failure report
+-- One structured reporter for every fatal path. The block is ASCII-only and
+-- delimited so it is easy to spot and easy to copy out of the terminal.
+local REPORT_WIDTH = 66
+
+-- Print `prefix` followed by `text`, word-wrapped so continuation lines line
+-- up under the text column. ASCII only.
+local function reportFill(prefix, text)
+  local line = prefix
+  local started = false
+  for word in tostring(text):gmatch("%S+") do
+    if not started then
+      line = line .. word
+      started = true
+    elseif #line + 1 + #word <= REPORT_WIDTH then
+      line = line .. " " .. word
+    else
+      print(line)
+      line = string.rep(" ", #prefix) .. word
+    end
+  end
+  if started then print(line) end
+end
+
+-- Turn an http.get failure into a reason string. http.get returns
+-- `nil, err, failingResponse`; when the third value is present its
+-- getResponseCode()/getResponseMessage() carry the HTTP status and message.
+local function httpReason(err, response)
+  local reason = tostring(err)
+  if type(response) == "table" then
+    local code, message
+    if type(response.getResponseCode) == "function" then
+      local ok, c = pcall(response.getResponseCode)
+      if ok then code = c end
+    end
+    if type(response.getResponseMessage) == "function" then
+      local ok, m = pcall(response.getResponseMessage)
+      if ok then message = m end
+    end
+    if code ~= nil or message ~= nil then
+      reason = reason .. " (HTTP " .. tostring(code or "?")
+        .. (message ~= nil and (" " .. tostring(message)) or "") .. ")"
+    end
+  end
+  return reason
+end
+
+-- Read the status off a live response handle. A mirror may answer with a
+-- non-nil handle and an error status; that must be reported too.
+local function responseStatus(handle)
+  if type(handle) ~= "table" or type(handle.getResponseCode) ~= "function" then
+    return nil, nil
+  end
+  local ok, code = pcall(handle.getResponseCode)
+  if not ok or type(code) ~= "number" then return nil, nil end
+  local message
+  if type(handle.getResponseMessage) == "function" then
+    local okm, m = pcall(handle.getResponseMessage)
+    if okm then message = m end
+  end
+  return code, message
+end
+
+-- The single fatal reporter. `details` is an optional array of extra lines
+-- (used to list every failed mirror). Aborts with the reason text, level 0 so
+-- no Lua traceback is printed.
+local function failStep(step, source, reason, hint, details)
+  print(string.rep("-", REPORT_WIDTH))
+  print("INSTALL FAILED")
+  print("  step   : " .. tostring(step))
+  if source and source ~= "" then print("  source : " .. tostring(source)) end
+  reportFill("  reason : ", reason)
+  if details then
+    for _, d in ipairs(details) do reportFill("           ", d) end
+  end
+  if hint and hint ~= "" then reportFill("  try    : ", hint) end
+  print(string.rep("-", REPORT_WIDTH))
+  error(tostring(reason), 0)
+end
+
+-- Each discrete step prints one start line before it runs.
+local function stepStart(name)
+  print("Step: " .. name)
+end
+
+-- Report that every mirror failed, listing each url and its own error.
+local function mirrorFailure(step, what, errors)
+  local details = {}
+  for i, e in ipairs(errors) do
+    details[#details + 1] = ("mirror %d: %s"):format(i, e.url)
+    details[#details + 1] = ("error: %s"):format(e.reason)
+  end
+  failStep(step, "all mirrors for " .. what,
+    ("could not obtain %s from any of the %d mirrors"):format(what, #errors),
+    "check the computer's network and http whitelist, then retry; the source menu lists each host",
+    details)
+end
+
 -- Optional argv[2]: an explicit client install root. When present, disk
 -- detection and the interactive prompt are skipped. A trailing slash is
 -- optional; it is normalised here so the rest of the installer can always
 -- append "ccncm".
+stepStart("read config and arguments")
 local explicitRoot
-if args[2] and args[2] ~= "" then
-  explicitRoot = args[2]
-  if explicitRoot:sub(1, 1) ~= "/" then explicitRoot = "/" .. explicitRoot end
-  if explicitRoot:sub(-1) ~= "/" then explicitRoot = explicitRoot .. "/" end
+local cfgOk, cfgErr = pcall(function()
+  if args[2] and args[2] ~= "" then
+    explicitRoot = args[2]
+    if explicitRoot:sub(1, 1) ~= "/" then explicitRoot = "/" .. explicitRoot end
+    if explicitRoot:sub(-1) ~= "/" then explicitRoot = explicitRoot .. "/" end
+  end
+end)
+if not cfgOk then
+  failStep("read config and arguments", "argv[2]", tostring(cfgErr),
+    "pass an absolute install root such as /disk, or omit the second argument")
 end
 
 -- The internal disk is the default and the fallback. Normalise CONFIG.root the
@@ -130,9 +243,28 @@ local function log(fmt, ...)
   if select("#", ...) > 0 then print(fmt:format(...)) else print(fmt) end
 end
 
-local function die(msg)
-  printError("install: " .. msg)
-  error(msg, 0)
+-- Byte-count sanity: when the response carried Content-Length, the received
+-- byte count must match it. When it did not, say so rather than staying
+-- silent so the operator knows the download was unverifiable.
+local function noteByteCount(got, total)
+  if total and total > 0 then
+    log("  received %d bytes (Content-Length: %d)", got, total)
+  else
+    log("  received %d bytes (no Content-Length header)", got)
+  end
+end
+
+local function byteMismatch(got, total)
+  if total and total > 0 and got ~= total then
+    return ("expected %d bytes, received %d"):format(total, got)
+  end
+  return nil
+end
+
+-- CC's fs API prepends "file:line: " to errors it raises; keep only the
+-- filesystem's own message so the reported error is about the actual problem.
+local function fsErrorText(err)
+  return (tostring(err):gsub("^.-:%d+:%s*", "", 1))
 end
 
 local function mkdirp(dir)
@@ -231,7 +363,8 @@ local function finishProgress()
 end
 
 -- content-length from the response headers, matched case-insensitively. nil
--- when the server did not send one (the bar then shows the byte count only).
+-- when the server did not send one (the bar then shows the byte count only and
+-- the completion line says the download was not verifiable).
 local function contentLength(handle)
   if type(handle.getResponseHeaders) ~= "function" then return nil end
   local ok, headers = pcall(handle.getResponseHeaders)
@@ -246,17 +379,22 @@ local function contentLength(handle)
 end
 
 -- Read a single-response body in chunks, drawing the download bar as it
--- arrives, and return the whole body. CC:Tweaked's read(n) blocks until n
--- bytes or EOF and returns nil at EOF, so the bar follows the network.
--- CraftOS-PC's read(n) is a non-blocking readsome() that can return "" once it
--- has drained its buffer; the first empty read falls back to readAll() (which
--- blocks until the rest is buffered) so the installer still terminates with
--- the whole archive.
+-- arrives, and return the whole body, the received byte count and the
+-- advertised Content-Length (nil when the server sent none). CC:Tweaked's
+-- read(n) blocks until n bytes or EOF and returns nil at EOF, so the bar
+-- follows the network. CraftOS-PC's read(n) is a non-blocking readsome() that
+-- can return "" once it has drained its buffer; the first empty read falls
+-- back to readAll() (which blocks until the rest is buffered) so the installer
+-- still terminates with the whole archive.
 local DOWNLOAD_CHUNK = 32768
 
 local function readBodyProgress(handle, label)
   local total = contentLength(handle)
   local out, got, drewFinal = {}, 0, false
+  local function detail(n)
+    if total and total > 0 then return humanBytes(n) end
+    return humanBytes(n) .. " (no Content-Length)"
+  end
   if type(handle.read) == "function" then
     while true do
       local chunk = handle.read(DOWNLOAD_CHUNK)
@@ -267,28 +405,33 @@ local function readBodyProgress(handle, label)
           if #rest > 0 then
             out[#out + 1] = rest
             got = got + #rest
-            drewFinal = drawProgress(label, got, total, humanBytes(got))
+            drewFinal = drawProgress(label, got, total, detail(got))
           end
         end
         break
       end
       out[#out + 1] = chunk
       got = got + #chunk
-      drewFinal = drawProgress(label, got, total, humanBytes(got))
+      drewFinal = drawProgress(label, got, total, detail(got))
     end
   end
   if got == 0 and type(handle.readAll) == "function" then
     local body = handle.readAll() or ""
     if #body > 0 then
-      drawProgress(label, #body, total, humanBytes(#body))
-      return body, #body
+      drawProgress(label, #body, total, detail(#body))
+      return body, #body, total
     end
   end
-  if total and total > 0 and not drewFinal then
-    -- Guarantee a clean final frame even if the last draws were throttled.
-    drawProgress(label, total, total, humanBytes(total))
+  if total and total > 0 and got >= total and not drewFinal then
+    -- Guarantee a clean 100% frame even if the last draws were throttled.
+    drawProgress(label, total, total, detail(total))
+  elseif not drewFinal then
+    -- A truncated body: draw the real byte count so the bar never claims 100%
+    -- for a short read. The byte-count check reports the mismatch right after.
+    lastDraw = 0
+    drawProgress(label, got, total, detail(got))
   end
-  return table.concat(out), got
+  return table.concat(out), got, total
 end
 
 -- ------------------------------------------------------------ storage probe
@@ -416,6 +559,7 @@ end
 -- is offered once with a [y/N] prompt (default NO). Candidates that do not fit
 -- are still printed, so the user can see why the internal disk was kept.
 local function chooseStorage(needed)
+  stepStart("choose storage target")
   if explicitRoot then
     pcall(mkdirp, explicitRoot)
     log("Using the install root from the command line: %s", explicitRoot)
@@ -458,18 +602,21 @@ end
 -- chunked/big-GET helper is needed. That helper is also wrong here: CDNs such
 -- as jsDelivr force gzip on text responses and CraftOS decompresses the body,
 -- which makes byte-range validation fail.
+--
+-- Returns `handle` on success, or `nil, err, failingResponse` so the caller
+-- can report the HTTP status the response carried.
 local function plainGet(url)
   if not http then
-    die("the HTTP API is unavailable (use an Advanced Computer and enable http)")
+    return nil, "the HTTP API is unavailable (use an Advanced Computer and enable http)"
   end
-  local lastErr
+  local lastErr, lastResp
   for _ = 1, 3 do
-    local h, err = http.get(url, nil, true)
+    local h, err, resp = http.get(url, nil, true)
     if h then return h end
-    lastErr = err
+    lastErr, lastResp = err, resp
     sleep(1)
   end
-  return nil, lastErr
+  return nil, lastErr, lastResp
 end
 
 -- CC:Tweaked charges every file its contents plus the length of its path (and a
@@ -493,6 +640,11 @@ local function tarHeader(hdr)
   return name, full, size, typeflag
 end
 
+-- A valid USTAR archive starts with a header carrying the "ustar" magic.
+local function tarMagicOk(body)
+  return #body >= 512 and body:sub(258, 262) == "ustar"
+end
+
 -- Pass 1: measure an in-memory USTAR archive without writing anything.
 --
 -- USTAR stores each entry as a fixed 512-byte header block followed by its data
@@ -513,8 +665,25 @@ local function measureTar(body)
   return total, entries
 end
 
+-- Describe an archive for diagnostics: how many entries were found and the
+-- first few entry names. Used when the body is not USTAR or an entry is
+-- missing, so the operator can see what the server actually returned.
+local function tarDiagnostics(body)
+  local names, entries, pos = {}, 0, 1
+  while pos + 511 <= #body do
+    local hdr = body:sub(pos, pos + 511)
+    local name, full, size = tarHeader(hdr)
+    if name == "" then break end -- end-of-archive marker
+    entries = entries + 1
+    if #names < 4 then names[#names + 1] = full ~= "" and full or name end
+    pos = pos + 512 + math.ceil(size / 512) * 512
+  end
+  return entries, names
+end
+
 -- True when the archive carries a regular-file entry whose full path is `want`.
--- Used to confirm the lib bundle really contains Lib/basalt.lua before writing.
+-- Used to confirm a bundle really contains the framework/client entry before
+-- anything is written to disk.
 local function tarHasEntry(body, want)
   local pos = 1
   while pos + 511 <= #body do
@@ -527,31 +696,89 @@ local function tarHasEntry(body, want)
   return false
 end
 
+-- Sanity-check a downloaded archive before using it. Returns the entry count,
+-- or nil plus a reason. On failure it prints what was found: the entry count,
+-- the first few entry names and the body size.
+local function checkTar(step, source, body, required)
+  stepStart(step)
+  local entries, names = tarDiagnostics(body)
+  local found = ("found %d entries, body %d bytes"):format(entries, #body)
+  if #names > 0 then found = found .. ", first entries: " .. table.concat(names, ", ") end
+
+  if not tarMagicOk(body) or entries == 0 then
+    print("  archive sanity: " .. found)
+    return nil, "not a USTAR archive (" .. found .. ")"
+  end
+  if required and not tarHasEntry(body, required) then
+    print("  archive sanity: " .. found)
+    return nil, ("required entry %s is missing (%s)"):format(required, found)
+  end
+  log("  archive sanity: OK (%d entries, body %d bytes)", entries, #body)
+  return entries
+end
+
 -- Pass 2: extract an in-memory USTAR archive under `root`. This is the same
 -- walk measureTar() uses, and it runs only after the free-space check passes,
--- so nothing is written before the check.
-local function extractTar(body, root, entries)
+-- so nothing is written before the check. Each entry's work is wrapped in
+-- pcall: an "out of space" or "read-only mount" error names the entry that
+-- failed and the filesystem's own error text instead of a raw traceback.
+local function extractTar(body, root, entries, step, source)
   local count, pos, done = 0, 1, 0
   while pos + 511 <= #body do
     local hdr = body:sub(pos, pos + 511)
     local name, full, size, typeflag = tarHeader(hdr)
     if name == "" then break end -- end-of-archive marker
     pos = pos + 512
-    if typeflag == "5" then
-      mkdirp((root .. full):gsub("/+$", ""))
-    else
-      mkdirp(dirname(root .. full))
-      local f = assert(fs.open(root .. full, "wb"))
-      f.write(body:sub(pos, pos + size - 1))
-      f.close()
-      count = count + 1
-    end
     done = done + 1
+    local ok, err = pcall(function()
+      if typeflag == "5" then
+        mkdirp((root .. full):gsub("/+$", ""))
+      else
+        mkdirp(dirname(root .. full))
+        local f = fs.open(root .. full, "wb")
+        if not f then error("cannot open " .. root .. full .. " for writing", 0) end
+        f.write(body:sub(pos, pos + size - 1))
+        f.close()
+        count = count + 1
+      end
+    end)
+    if not ok then
+      finishProgress()
+      local detail = ("entry %d/%d %q: %s"):format(done, entries or 0, full, fsErrorText(err))
+      print("  " .. detail)
+      failStep(step, source, detail,
+        "the target filesystem is full or read-only; free space or choose another install root")
+    end
     drawProgress("Extract", done, entries, ("%d/%d files"):format(done, entries or 0))
     pos = pos + math.ceil(size / 512) * 512
   end
   finishProgress()
   return count
+end
+
+-- Download one archive and sanity-check it. Returns body, entries on success,
+-- or nil, reason on any per-mirror failure: connection error (with HTTP
+-- status when the response carried one), non-2xx status, Content-Length
+-- mismatch, a body that is not USTAR, or a missing required entry.
+local function downloadArchive(url, label, required)
+  local handle, gerr, gresp = plainGet(url)
+  if not handle then return nil, httpReason(gerr, gresp) end
+  local code, message = responseStatus(handle)
+  if code and code >= 400 then
+    handle.close()
+    if message then return nil, ("HTTP %d %s"):format(code, tostring(message)) end
+    return nil, ("HTTP %d"):format(code)
+  end
+  local body, got, total = readBodyProgress(handle, "Download")
+  handle.close()
+  finishProgress()
+  stepStart("check byte count of " .. label)
+  noteByteCount(got, total)
+  local mismatch = byteMismatch(got, total)
+  if mismatch then return nil, mismatch end
+  local entries, tarErr = checkTar("check tar archive " .. label, url, body, required)
+  if not entries then return nil, tarErr end
+  return body, entries
 end
 
 -- True when the shared framework is present, either at the absolute shared
@@ -567,6 +794,7 @@ end
 -- Offer to install the library when it is missing, then fall through to the
 -- client install once /ncm/init.lua exists. Declining leaves the computer
 -- untouched (same behaviour as the older print-and-exit installer).
+stepStart("check the ncm library")
 if not fs.exists(NCM_INIT) then
   print("CC-CloudMusicNCM installer: the ncm library is not installed.")
   print("")
@@ -600,12 +828,16 @@ if not fs.exists(NCM_INIT) then
 
   print("")
   print("Running the ncm library installer ...")
-  shell.run("wget", "run", LIB_INSTALL_URL, LIB_BASE_URL)
+  local runOk, runErr = pcall(shell.run, "wget", "run", LIB_INSTALL_URL, LIB_BASE_URL)
+  if not runOk then
+    failStep("install the ncm library", LIB_INSTALL_URL, tostring(runErr),
+      "run the library installer manually, then retry: " .. NCM_INSTALL_CMD)
+  end
 
   if not fs.exists(NCM_INIT) then
-    die("the ncm library installer finished but " .. NCM_INIT .. " is still missing.\n"
-      .. "  It may have failed or been aborted. Run this command manually, then retry:\n"
-      .. "  " .. NCM_INSTALL_CMD)
+    failStep("install the ncm library", LIB_INSTALL_URL,
+      NCM_INIT .. " is still missing after the library installer ran",
+      "run this exact command manually, then retry: " .. NCM_INSTALL_CMD)
   end
   print("ncm library installed at /ncm; continuing with the client install.")
   print("")
@@ -644,6 +876,7 @@ local function pickSource()
     return
   end
 
+  stepStart("select download source")
   print("Choose a download source:")
   for i, m in ipairs(MIRRORS) do print(("  %d) %s"):format(i, m.name)) end
   print(("  %d) Custom URL"):format(#MIRRORS + 1))
@@ -662,7 +895,12 @@ local function pickSource()
   end
 end
 
-pickSource()
+local pickOk, pickErr = pcall(pickSource)
+if not pickOk then
+  failStep("select download source", "argv",
+    tostring(pickErr),
+    "pass a valid bundle base URL as the first argument, or run without arguments for the menu")
+end
 
 -- ------------------------------------------------------------- stage A: Basalt
 -- Install the shared Basalt UI framework once, on the internal disk only.
@@ -674,6 +912,7 @@ pickSource()
 -- nothing fancier than existence plus that sanity check is compared. If the
 -- framework cannot fit, the client stage must not run.
 local function installBasalt(sources)
+  stepStart("install shared Basalt UI framework")
   log("[1/5] Shared Basalt UI framework at %s ...", BASALT_PATH)
 
   if fs.exists(BASALT_PATH) then
@@ -690,50 +929,55 @@ local function installBasalt(sources)
     log("  found an empty %s; reinstalling it.", BASALT_PATH)
   end
 
-  local body
+  local body, entries, source
+  local mirrorErrors = {}
   for i = 1, #sources do
-    local base = sources[i]
-    log("  source %d/%d: %s", i, #sources, base)
-    local handle, err = plainGet(base .. "/" .. CONFIG.libBundle)
-    if handle then
-      body = readBodyProgress(handle, "Download")
-      handle.close()
-      finishProgress()
+    local url = sources[i] .. "/" .. CONFIG.libBundle
+    stepStart(("download shared Basalt bundle (mirror %d/%d)"):format(i, #sources))
+    log("  url: %s", url)
+    local b, info = downloadArchive(url, CONFIG.libBundle, BASALT_ENTRY)
+    if b then
+      body, entries, source = b, info, url
       break
     end
-    log("  download failed: %s", tostring(err))
+    print(("  mirror failed: %s"):format(url))
+    print(("  reason: %s"):format(info))
+    print("  trying the next mirror ...")
+    mirrorErrors[#mirrorErrors + 1] = { url = url, reason = info }
   end
   if not body then
-    die("could not download " .. CONFIG.libBundle .. " from any mirror")
+    mirrorFailure("download " .. CONFIG.libBundle, CONFIG.libBundle, mirrorErrors)
   end
 
-  -- The lib bundle must contain exactly the shared framework; refuse anything
-  -- that does not (guards against serving the wrong file from a stale mirror).
-  if not tarHasEntry(body, BASALT_ENTRY) then
-    die(CONFIG.libBundle .. " does not contain " .. BASALT_ENTRY)
-  end
-
-  local totalBytes, entries = measureTar(body)
+  local totalBytes = measureTar(body)
   local needed = totalBytes + entries * PER_ENTRY_OVERHEAD
   log("  archive: %d entries, %d bytes (needs about %d with per-file overhead)",
     entries, totalBytes, needed)
 
+  stepStart("check free space for the shared framework")
   if type(fs.getFreeSpace) == "function" then
-    local free = fs.getFreeSpace(internalRoot)
-    log("  free space on %s: %d bytes", internalRoot, free)
+    local okf, free = pcall(fs.getFreeSpace, internalRoot)
+    if not okf then
+      failStep("check free space", internalRoot, tostring(free),
+        "the filesystem cannot report free space; check the computer's disk")
+    end
+    log("  free %d bytes, needed %d bytes (%d entries)", free, needed, entries)
     if free < needed then
-      die(("not enough disk space for the shared framework: %d bytes free, this archive "
-        .. "needs about %d bytes (%d entries).\n"
-        .. "  Delete files on the computer, or raise computer_space_limit in\n"
-        .. "  config/computercraft-server.toml (then restart the world), and retry.")
-        :format(free, needed, entries))
+      failStep("check free space", internalRoot,
+        ("not enough disk space for the shared framework: %d bytes free, this archive "
+          .. "needs about %d bytes (%d entries)"):format(free, needed, entries),
+        "delete files on the computer, or raise computer_space_limit in "
+          .. "config/computercraft-server.toml (then restart the world), and retry")
     end
   end
 
-  local files = extractTar(body, internalRoot, entries)
+  stepStart("extract " .. CONFIG.libBundle)
+  local files = extractTar(body, internalRoot, entries, "extract " .. CONFIG.libBundle, source)
   log("  extracted %d files", files)
   if not fs.exists(BASALT_PATH) then
-    die("extraction finished but " .. BASALT_PATH .. " is missing")
+    failStep("verify shared framework", BASALT_PATH,
+      BASALT_PATH .. " is missing after extraction",
+      "re-run the installer and pick another mirror")
   end
 end
 
@@ -744,23 +988,26 @@ end
 -- archive itself: a hardcoded byte count goes stale as soon as the bundle
 -- changes, and it cannot account for CC charging disk per file.
 local function installClient(sources)
+  stepStart("download and measure the client bundle")
   log("[2/5] Downloading and measuring the client bundle ...")
   local installed = false
   local installRoot, installTarget, removedPrev
+  local mirrorErrors = {}
   for i = 1, #sources do
-    local base = sources[i]
-    log("  source %d/%d: %s", i, #sources, base)
+    local url = sources[i] .. "/" .. CONFIG.bundle
+    stepStart(("download client bundle (mirror %d/%d)"):format(i, #sources))
+    log("  url: %s", url)
 
-    local handle, err = plainGet(base .. "/" .. CONFIG.bundle)
-    if not handle then
-      log("  download failed: %s", tostring(err))
+    local body, info = downloadArchive(url, CONFIG.bundle, "ccncm/startup.lua")
+    if not body then
+      print(("  mirror failed: %s"):format(url))
+      print(("  reason: %s"):format(info))
+      print("  trying the next mirror ...")
+      mirrorErrors[#mirrorErrors + 1] = { url = url, reason = info }
     else
+      local entries = info
       -- Buffer the whole archive, then measure it BEFORE writing a single byte.
-      local body = readBodyProgress(handle, "Download")
-      handle.close()
-      finishProgress()
-
-      local totalBytes, entries = measureTar(body)
+      local totalBytes = measureTar(body)
       local needed = totalBytes + entries * PER_ENTRY_OVERHEAD
       log("  archive: %d entries, %d bytes (needs about %d with per-file overhead)",
         entries, totalBytes, needed)
@@ -777,26 +1024,38 @@ local function installClient(sources)
       -- idempotent. Only <target>ccncm is ever touched; the shared
       -- /Lib/basalt.lua is never removed.
       if not removedPrev then
-        log("[3/5] Removing previous client install (if any) ...")
-        rmrf(installTarget)
+        stepStart("remove previous client install")
+        local rok, rerr = pcall(rmrf, installTarget)
+        if not rok then
+          failStep("remove previous client install", installTarget, tostring(rerr),
+            "close any program using it and check that the mount is writable")
+        end
         removedPrev = true
       end
 
+      stepStart("check free space for the client")
       if type(fs.getFreeSpace) == "function" then
-        local free = fs.getFreeSpace(installRoot)
-        log("  free space: %d bytes", free)
+        local okf, free = pcall(fs.getFreeSpace, installRoot)
+        if not okf then
+          failStep("check free space", installRoot, tostring(free),
+            "the filesystem cannot report free space; check the computer's disk")
+        end
+        log("  free %d bytes, needed %d bytes (%d entries)", free, needed, entries)
         if free < needed then
-          local msg = ("not enough disk space: %d bytes free, this archive needs about %d bytes (%d entries)."):format(
-            free, needed, entries)
-          if installRoot == internalRoot then
-            msg = msg .. "\n  Delete files on the computer, or raise computer_space_limit in\n"
-              .. "  config/computercraft-server.toml (then restart the world), and retry."
+          local hint = "delete files on the computer, or raise computer_space_limit in "
+            .. "config/computercraft-server.toml (then restart the world), and retry"
+          if installRoot ~= internalRoot then
+            hint = "free space on " .. installRoot .. ", or let the installer keep the internal disk"
           end
-          die(msg)
+          failStep("check free space", installRoot,
+            ("not enough disk space: %d bytes free, this archive needs about %d bytes (%d entries)")
+              :format(free, needed, entries),
+            hint)
         end
       end
 
-      local files = extractTar(body, installRoot, entries)
+      stepStart("extract " .. CONFIG.bundle)
+      local files = extractTar(body, installRoot, entries, "extract " .. CONFIG.bundle, url)
       log("  extracted %d files", files)
 
       if fs.exists(installTarget .. "/startup.lua")
@@ -807,33 +1066,41 @@ local function installClient(sources)
         if i > 1 then log("  note: the chosen source failed; using another mirror") end
         break
       end
-      log("  bundle incomplete; trying another mirror ...")
-      rmrf(installTarget)
+      print(("  mirror failed: %s"):format(url))
+      print("  reason: archive extracted but required client files are missing")
+      print("  trying the next mirror ...")
+      mirrorErrors[#mirrorErrors + 1] = {
+        url = url, reason = "archive extracted but required client files are missing",
+      }
+      pcall(rmrf, installTarget)
     end
   end
   if not installed then
-    die("could not install a complete bundle from any mirror")
+    mirrorFailure("download client bundle", CONFIG.bundle, mirrorErrors)
   end
 
   -- Verify the files startup.lua loads and print the run instruction.
+  stepStart("verify installed files")
   log("[4/5] Verifying ...")
   local checks = {
     "startup.lua",
     "Lib/utf8display.lua",
     "icons/Home.lua",
   }
-  local allOk = true
+  local missing = {}
   for _, rel in ipairs(checks) do
     local ok = fs.exists(installTarget .. "/" .. rel)
     log("  %s %s", ok and "OK  " or "MISS", rel)
-    if not ok then allOk = false end
+    if not ok then missing[#missing + 1] = rel end
   end
   local basaltOk = basaltAvailable(installTarget)
   log("  %s %s", basaltOk and "OK  " or "MISS",
     "Lib/basalt.lua (shared at " .. BASALT_PATH .. ")")
-  if not basaltOk then allOk = false end
-  if not allOk then
-    die("verification failed: a required file did not land under " .. installTarget)
+  if not basaltOk then missing[#missing + 1] = "Lib/basalt.lua" end
+  if #missing > 0 then
+    failStep("verify installed files", installTarget,
+      "missing: " .. table.concat(missing, ", "),
+      "re-run the installer; if it repeats, delete " .. installTarget .. " and retry")
   end
 
   -- The run command is relative to / so it works from the default shell prompt.
