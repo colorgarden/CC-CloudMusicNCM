@@ -3,8 +3,9 @@
   NetEase Cloud Music client (Basalt UI + utf8display CJK bitmaps).
 
   What it does
-    1. checks that the `ncm` library is installed at /ncm and, when it is
-       not, prints the command that installs it and stops,
+    1. checks that the `ncm` library is installed at /ncm; when it is missing,
+       offers to download and run the library installer through the ghproxy
+       mirror and, once /ncm/init.lua exists, continues automatically,
     2. removes any previous /ccncm install,
     3. checks free disk space,
     4. streams dist/ccncm.tar off the internet straight into the filesystem
@@ -26,8 +27,7 @@
 
   Requirements
     * An Advanced Computer (or Command Computer) with the HTTP API enabled.
-    * The `ncm` library at /ncm (installed by the NeteaseCloudMusicApiLibCCT
-      installer).
+    * The `ncm` library at /ncm (this installer can fetch it for you).
     * The server must allow the chosen mirror host in its http whitelist.
 
   Usage
@@ -54,40 +54,24 @@ local CONFIG = {
 
 local args = { ... }
 
--- ---------------------------------------------------------------- ncm pre-check
--- The client's data layer is require("ncm"); without it nothing can run, so
--- refuse to install and point at the library installer instead.
+-- ---------------------------------------------------------------- ncm constants
+-- The client's data layer is require("ncm"); without it nothing can run.
 local NCM_INIT = "/ncm/init.lua"
 local NCM_INSTALL_CMD = "wget run https://ghproxy.net/https://raw.githubusercontent.com/"
   .. "colorgarden/NeteaseCloudMusicApiLibCCT/main/install.lua "
   .. "https://ghproxy.net/https://raw.githubusercontent.com/"
   .. "colorgarden/NeteaseCloudMusicApiLibCCT/main"
 
-if not fs.exists(NCM_INIT) then
-  print("CC-CloudMusicNCM installer: the ncm library is not installed.")
-  print("")
-  print("Expected to find " .. NCM_INIT .. " but it is missing.")
-  print("Install the library first by running this exact command on the computer:")
-  print("")
-  print(NCM_INSTALL_CMD)
-  print("")
-  print("Once /ncm/init.lua exists, run this installer again.")
-  return
-end
-
--- --------------------------------------------------------------- source pick
--- Same mirror style as the reference installer. No interactive menu: the
--- first usable source wins, and a command-line argument overrides them all.
-local MIRRORS = {
-  { name = "jsDelivr (recommended)", base = "https://cdn.jsdelivr.net/gh/colorgarden/CC-CloudMusicNCM@main" },
-  { name = "GitHub raw", base = "https://raw.githubusercontent.com/colorgarden/CC-CloudMusicNCM/main" },
-  { name = "ghproxy.net (GitHub proxy)", base = "https://ghproxy.net/https://raw.githubusercontent.com/colorgarden/CC-CloudMusicNCM/main" },
-}
-
-if args[1] and args[1] ~= "" then
-  CONFIG.base = args[1]:gsub("/+$", "")
-  print("Using command-line source: " .. CONFIG.base)
-end
+-- The same URLs as NCM_INSTALL_CMD, split out so this installer can invoke wget
+-- itself instead of only telling the user to. ghproxy is deliberate: it streams
+-- the live raw files, whereas jsDelivr caches each file of an @main URL
+-- separately and has served stale library bundles before. The base URL is passed
+-- as argv[1] to the library installer so it too uses ghproxy for its bundle and
+-- skips its own interactive source menu.
+local LIB_INSTALL_URL = "https://ghproxy.net/https://raw.githubusercontent.com/"
+  .. "colorgarden/NeteaseCloudMusicApiLibCCT/main/install.lua"
+local LIB_BASE_URL = "https://ghproxy.net/https://raw.githubusercontent.com/"
+  .. "colorgarden/NeteaseCloudMusicApiLibCCT/main"
 
 -- ----------------------------------------------------------------- utilities
 local function log(fmt, ...)
@@ -218,6 +202,68 @@ local function untar(handle, root)
     end
   end
   return count
+end
+
+-- ---------------------------------------------------------------- ncm pre-check
+-- Offer to install the library when it is missing, then fall through to the
+-- client install once /ncm/init.lua exists. Declining leaves the computer
+-- untouched (same behaviour as the older print-and-exit installer).
+if not fs.exists(NCM_INIT) then
+  print("CC-CloudMusicNCM installer: the ncm library is not installed.")
+  print("")
+  print("Expected to find " .. NCM_INIT .. " but it is missing.")
+  print("Install the library first by running this exact command on the computer:")
+  print("")
+  print(NCM_INSTALL_CMD)
+  print("")
+
+  write("Download and run the ncm library installer now, using the ghproxy mirror? [y/N] ")
+  local ans = read and read() or nil
+  local yes = type(ans) == "string" and ans:match("^[yY]") ~= nil
+
+  if not yes then
+    print("")
+    print("Not installing the ncm library. Run this exact command, then re-run this installer:")
+    print("")
+    print(NCM_INSTALL_CMD)
+    return
+  end
+
+  local wget = shell and shell.resolveProgram and shell.resolveProgram("wget")
+  if not wget then
+    print("")
+    print("Cannot find the `wget` program on this computer.")
+    print("Run this exact command manually, then re-run this installer:")
+    print("")
+    print(NCM_INSTALL_CMD)
+    return
+  end
+
+  print("")
+  print("Running the ncm library installer ...")
+  shell.run("wget", "run", LIB_INSTALL_URL, LIB_BASE_URL)
+
+  if not fs.exists(NCM_INIT) then
+    die("the ncm library installer finished but " .. NCM_INIT .. " is still missing.\n"
+      .. "  It may have failed or been aborted. Run this command manually, then retry:\n"
+      .. "  " .. NCM_INSTALL_CMD)
+  end
+  print("ncm library installed at /ncm; continuing with the client install.")
+  print("")
+end
+
+-- --------------------------------------------------------------- source pick
+-- Same mirror style as the reference installer. No interactive menu: the
+-- first usable source wins, and a command-line argument overrides them all.
+local MIRRORS = {
+  { name = "jsDelivr (recommended)", base = "https://cdn.jsdelivr.net/gh/colorgarden/CC-CloudMusicNCM@main" },
+  { name = "GitHub raw", base = "https://raw.githubusercontent.com/colorgarden/CC-CloudMusicNCM/main" },
+  { name = "ghproxy.net (GitHub proxy)", base = "https://ghproxy.net/https://raw.githubusercontent.com/colorgarden/CC-CloudMusicNCM/main" },
+}
+
+if args[1] and args[1] ~= "" then
+  CONFIG.base = args[1]:gsub("/+$", "")
+  print("Using command-line source: " .. CONFIG.base)
 end
 
 -- --------------------------------------------------------------------- main
