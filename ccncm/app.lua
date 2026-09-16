@@ -1147,11 +1147,10 @@ function M.build()
     return false, tostring(nerr)
   end
 
-  -- Surface (on the computer terminal, never the monitor) the one case where
-  -- several speakers cannot be synchronised on this CC:Tweaked build, instead
-  -- of leaving the user with silent multi-speaker drift later.
-  local syncNote = data.speakerSyncNote and data.speakerSyncNote()
-  if syncNote then data.printNative("speaker: " .. syncNote) end
+  -- Multi-speaker notes are emitted by data.runSpeaker() when playback starts:
+  -- all detected speakers are passed as ONE group (no drift), and >8 speakers
+  -- warn there because Minecraft drops the extra streams.  Nothing to print at
+  -- build time.
 
   -- Resolve the session synchronously BEFORE the UI gates are built, so the
   -- very first paint already knows whether the user is logged in (previously

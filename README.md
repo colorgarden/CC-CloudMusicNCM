@@ -32,7 +32,9 @@
 3. **`ncm` 库安装在 `/ncm`**:用 `netease-ncm-lua` 仓库的 `install.lua`
    在电脑上安装。安装后应能看到 `/ncm/init.lua`、`/ncm/lib.lua`、
    `/ncm/lib/speaker.lua`、`/ncm/lib/cc_big_http.lua`、`/ncm/lib/aeslua/`。
-4. **一个扬声器**外设(`peripheral.find("speaker")` 能找到)。
+4. **至少一个扬声器**外设。可以接多个:客户端会把探测到的所有扬声器放进同一个
+   分组以保持同步;但 Minecraft 同时最多播放 **8** 路流式声音,**第 9 个及以后会
+   被丢弃**(详见「多扬声器同步」)。
 5. speaker 程序的**转码服务可达**(默认 `http://newgmapi.liulikeji.cn/api/ffmpeg`,
    可在 speaker 程序里用 `-server` 改;本客户端只通过启动 speaker 间接使用它,
    数据路径本身不依赖任何远程代理)。
@@ -211,7 +213,45 @@ CCNCM/startup
 
 若项目就在电脑根目录,开机后会自动运行 `/startup`(即 `startup.lua`)。
 
-界面使用**电脑自身的终端**,不需要显示器(monitor)。
+界面**必须**接一个显示器(monitor):Basalt 把 UI 画在 monitor 上,**电脑自身的
+终端不画界面,只用来打印日志/诊断/错误**。所以 monitor 是纯 UI、电脑终端是纯
+日志,互不遮挡。**没有 monitor 时,程序会在电脑终端打印一段 ASCII 提示并直接
+退出**(不会退回电脑终端画界面)。
+
+**monitor 要求:**
+
+- 启动时会调用 `monitor.setTextScale(0.5)`,布局按 **51x19** 字符设计。因此推荐
+  **3x2 块**,至少 **2x2**;太小会在电脑终端打印一行
+  `warning: monitor is WxH but the layout needs 51x19. Recommended: 3x2 blocks (2x2 minimum). Continuing.`,
+  但仍然继续运行(列表可滚动)。
+- **所有日志/诊断/错误都通过 `term.native()` 输出到电脑自身的终端**,不会画到
+  monitor 上;模块加载失败、字体失败等致命错误同样以 ASCII 打到电脑终端。
+
+## 多扬声器同步
+
+客户端会把**探测到的所有扬声器**放进**同一个 `main` 分组**,通过
+`-speaker '{"main":[...]}'` 一次性传给 `/ncm/lib/speaker.lua`:
+
+- speakerlib 在每个分组内部对**每个扬声器**各跑一个协程:各自重试
+  `speaker.playAudio`,直到收到**按自己名字过滤**的 `speaker_audio_empty`
+  事件,再用 `parallel.waitForAll` 汇合后才写下一块。这个**逐块屏障**保证同组
+  扬声器写的是同一块,消除了**累积的写入顺序漂移**。
+- **原版 CC:Tweaked 没有多扬声器 API**:`speaker` 外设只有 `playNote`、
+  `playSound`、`playAudio`、`stop`;`playAudio(audio, volume)` 返回布尔值、
+  一次性全收(`128*1024` 采样上限),且每个扬声器同一时刻只有一个待处理槽。
+  `playAudioEx` **不是原版接口**(cc_speakerlib 只是防御性地探测过它)。
+- 因此**原版无法保证采样级精确同步**:每个扬声器都是独立外设,由服务端的墙钟
+  估算各自推进;屏障只能消除写顺序漂移,这已是原版能达到的最好效果
+  (CC:Tweaked 的 "fix speaker desync" PR #2412 已关闭、未合并)。
+- 如果**人为把扬声器拆成多个分组**(例如按 `left`/`right`),speakerlib 会**按组
+  顺序**写入,组与组之间会漂移;所以客户端始终只传一个分组。真要把它们拆开时,
+  客户端会在电脑终端打印一行提示建议合并为一个分组。
+- **超过 8 个扬声器**:Minecraft 的引擎同时最多播放 `clamp(sqrt(n), 2, 8)` 路
+  流式声音(上限就是 **8**),**第 9 个及以后会被静默丢弃**;这是 Lua 侧无法绕过
+  的限制。客户端检测到超过 8 个扬声器时会在电脑终端打印一行警告。
+- `-speaker` 的值是 JSON,**必须用 `shell.execute` 启动**(`shell.run` 会重新
+  分词并拆坏 JSON 里的引号);只有极老的 shell 没有 `shell.execute` 时才回退到
+  `shell.run`,此时不传 JSON 分组、只驱动 `peripheral.find` 找到的那个扬声器。
 
 ## 目录结构
 
@@ -250,10 +290,11 @@ icons/*.lua          图标位图
 
 ## 已知限制
 
-- **播放会阻塞界面**:按题目约定,歌曲链接交给
-  `shell.run("/ncm/lib/speaker.lua", url, "-id", "ccncm")`。speaker 程序会
-  接管终端并同步播放到结束,期间 Basalt 界面不刷新;播放结束后界面会重绘。
-  没有应用内的暂停/继续/进度/音量控制(speaker 决定)。
+- **播放跑在后台协程里**:客户端用 `shell.execute`(不是 `shell.run`)启动
+  `/ncm/lib/speaker.lua`,并以 `-id ccncm`、`-noui`、`-speaker '{"main":[...]}'`
+  传参;播放由 Basalt 调度的协程驱动,speaker 的 `speakerlib_*` 事件回到界面,
+  因此播放栏能显示进度/暂停/音量。`shell.run` 会重新分词、拆坏 JSON,故必须用
+  `shell.execute`(旧 shell 无此 API 时才回退 `shell.run`,见上)。
 - **只支持单曲搜索**(`type=1`),没有专辑/歌手/MV 搜索。
 - **喜欢/收藏只读**:可以浏览“我喜欢的音乐”和“我的歌单”,不能在客户端里
   加/取消喜欢或编辑歌单。
@@ -262,8 +303,9 @@ icons/*.lua          图标位图
 - **播客页目前是占位**,仅提示“暂未实现”。
 - **无损音质可能因账号权限失败**:客户端先请求 `lossless`,失败后自动回退到
   `standard`;若仍无直链(版权/地区/会员),会弹出错误。
-- **布局按 51x19 及以上终端**设计;窗口过小会显得拥挤(列表可滚动)。
-  目前只在电脑自身终端渲染,不驱动 monitor。
+- **布局按 51x19 字符**设计,只画在 monitor 上:必须先 `setTextScale(0.5)`,
+  推荐 3x2 块(至少 2x2);monitor 过小时会在电脑终端打印警告,但仍继续运行
+  (列表可滚动、电脑终端只输出日志)。
 - **字体每次开机重新下载**(除非放置 `/ccncm_font.lua`)。
 - **“最近播放”是本地记录**,不是网易云的云端播放历史。
 - 源码文件(`.lua`)保持 **ASCII**:所有中文界面文案以 `\ddd` 十进制字节

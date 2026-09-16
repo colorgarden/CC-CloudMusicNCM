@@ -271,21 +271,43 @@ function M.hasSpeaker()
   return #M.speakerNames() > 0
 end
 
--- speakerlib reaches its synchronised speaker.playAudioEx write path only when
--- the peripheral exposes playAudioEx (newer CC:Tweaked / CC Audio Expand).
--- Without it the write degrades to a best-effort parallel playAudio.  Return
--- one ASCII line describing the limitation when several speakers are attached
--- and playAudioEx is absent, so the user is not left with silent drift; nil
--- when synchronised playback is available or only one speaker is attached.
-function M.speakerSyncNote()
-  if #M.speakerNames() <= 1 then return nil end
-  local sp
-  if peripheral and type(peripheral.find) == "function" then
-    local ok, found = pcall(peripheral.find, "speaker")
-    if ok then sp = found end
+-- Vanilla CC:Tweaked has no multi-speaker API: the speaker peripheral only
+-- exposes playNote/playSound/playAudio/stop, and playAudioEx is NOT part of it
+-- (cc_speakerlib merely probed for it defensively).  The community technique is
+-- a per-chunk barrier: one coroutine per speaker, each retrying playAudio until
+-- its own NAME-FILTERED speaker_audio_empty, then parallel.waitForAll so the
+-- next chunk starts only after every speaker accepted the same chunk.  Sync
+-- cannot be sample-accurate (every speaker is an independent peripheral paced by
+-- a server-side wall-clock estimate; CC:Tweaked PR #2412 "fix speaker desync"
+-- was closed unmerged), but the barrier removes cumulative write-order drift.
+--
+-- The client always hands speakerlib ONE group (`main` = every detected
+-- speaker), which is exactly the barrier-maintained configuration, so no note
+-- is needed.  Only a deliberate split into several groups makes speakerlib write
+-- them in turn, which drifts.  `groupCount` is how many groups the caller will
+-- pass; returns a one-line ASCII note for the multi-group case, else nil.
+function M.speakerSyncNote(groupCount)
+  groupCount = tonumber(groupCount) or 1
+  if groupCount > 1 then
+    return "speakers are split into " .. groupCount ..
+      " groups; speakerlib writes each group sequentially and they will drift - pass them as one group"
   end
-  if type(sp) == "table" and type(sp.playAudioEx) == "function" then return nil end
-  return "multi-speaker sync unavailable on this CC:Tweaked build; use one speaker"
+  return nil
+end
+
+-- Minecraft's sound engine keeps at most clamp(sqrt(n), 2, 8) simultaneous
+-- streaming sounds, i.e. 8 is the hard ceiling; speakers past the 8th are
+-- silently dropped.  Unfixable in Lua.  Return a one-line ASCII warning when
+-- more than MAX_STREAM_SPEAKERS speakers are attached, else nil.
+M.MAX_STREAM_SPEAKERS = 8
+function M.speakerCountWarning()
+  local n = #M.speakerNames()
+  if n > M.MAX_STREAM_SPEAKERS then
+    return string.format(
+      "warning: %d speakers attached; Minecraft streams at most %d simultaneous sounds (clamp(sqrt(n),2,8)), so extra speakers are dropped",
+      n, M.MAX_STREAM_SPEAKERS)
+  end
+  return nil
 end
 
 -- ============================================================================
@@ -599,10 +621,20 @@ function M.runSpeaker(url)
     return false, "no speaker attached"
   end
 
-  local note = M.speakerSyncNote()
+  -- Every detected speaker goes into ONE `main` group, so speakerlib's own
+  -- per-chunk barrier keeps them aligned (see speakerSyncNote).  Only a
+  -- deliberate multi-group split would drift, which speakerSyncNote reports.
+  local groups = { main = names }
+  local groupCount = 0
+  for _ in pairs(groups) do groupCount = groupCount + 1 end
+  local note = M.speakerSyncNote(groupCount)
   if note then M.printNative("speaker: " .. note) end
 
-  local group = textutils.serializeJSON({ main = names })
+  -- Minecraft drops streams past the 8th speaker; warn on the computer terminal.
+  local warning = M.speakerCountWarning()
+  if warning then M.printNative(warning) end
+
+  local group = textutils.serializeJSON(groups)
   local ok, res
   if type(shell.execute) == "function" then
     ok, res = pcall(shell.execute, SPEAKER_PROGRAM,
