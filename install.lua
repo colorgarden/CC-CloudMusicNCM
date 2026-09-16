@@ -6,11 +6,13 @@
     1. checks that the `ncm` library is installed at /ncm; when it is missing,
        offers to download and run the library installer through the ghproxy
        mirror and, once /ncm/init.lua exists, continues automatically,
-    2. removes any previous /ccncm install,
-    3. downloads dist/ccncm.tar fully into memory, measures what it needs,
-       checks free disk space against that measured figure, and only then
-       extracts it (uncompressed USTAR - no gzip library or temp file needed),
-    4. verifies the files that the client's startup.lua requires.
+    2. picks an install root: the internal disk by default, or a disk drive /
+       mounted filesystem with room for the archive, offered once (see Storage),
+    3. removes any previous <root>ccncm install,
+    4. downloads dist/ccncm.tar fully into memory, measures what it needs,
+       checks free space on the chosen root against that measured figure, and
+       only then extracts it (uncompressed USTAR - no gzip library or temp file),
+    5. verifies the files that the client's startup.lua requires.
 
   Layout (the bundle's entries are already rooted at `ccncm/`):
 
@@ -37,8 +39,23 @@
     -- pass a bundle base URL as the first argument to skip the menu:
     wget run <url> https://my.mirror/ccncm
 
-  Everything is installed under `/` by default. Change CONFIG.root below to
-  install elsewhere; the value must end with "/".
+    -- a second argument fixes the install root and skips the disk prompt
+    -- (a trailing slash is optional and normalised):
+    wget run <url> https://my.mirror/ccncm /disk
+
+  Storage
+    The client is installed under `<root>ccncm`, where `<root>` is the
+    internal disk (`/`) by default. Before writing anything, the installer
+    probes for filesystems that have room for the measured archive:
+      * disk drives reported by `peripheral.find("drive")` /
+        `peripheral.find("disk drive")`,
+      * the conventional mount points `/disk`, `/disk2` ... `/disk9`,
+      * any other directory whose `fs.getFreeSpace` differs from `/`'s - the
+        way the ROM's `mount` program attaches a directory as storage.
+    Each existing candidate is listed with its free space; if one fits, the
+    installer asks once (default NO) and otherwise falls back to the internal
+    disk, whose normal computed free-vs-needed check then decides. No drive
+    names, capacities or mount paths are assumed anywhere.
 ]]
 
 local CONFIG = {
@@ -51,6 +68,22 @@ local CONFIG = {
 }
 
 local args = { ... }
+
+-- Optional argv[2]: an explicit install root. When present, disk detection and
+-- the interactive prompt are skipped. A trailing slash is optional; it is
+-- normalised here so the rest of the installer can always append "ccncm".
+local explicitRoot
+if args[2] and args[2] ~= "" then
+  explicitRoot = args[2]
+  if explicitRoot:sub(1, 1) ~= "/" then explicitRoot = "/" .. explicitRoot end
+  if explicitRoot:sub(-1) ~= "/" then explicitRoot = explicitRoot .. "/" end
+end
+
+-- The internal disk is the default and the fallback. Normalise CONFIG.root the
+-- same way so installRoot always ends with "/".
+local internalRoot = CONFIG.root
+if internalRoot:sub(1, 1) ~= "/" then internalRoot = "/" .. internalRoot end
+if internalRoot:sub(-1) ~= "/" then internalRoot = internalRoot .. "/" end
 
 -- ---------------------------------------------------------------- ncm constants
 -- The client's data layer is require("ncm"); without it nothing can run.
@@ -103,6 +136,168 @@ local function rmrf(p)
   else
     fs.delete(p)
   end
+end
+
+-- ------------------------------------------------------------ storage probe
+-- Look for a filesystem other than the internal disk that the client could be
+-- installed onto (a disk drive or a directory the ROM mounted). Nothing here
+-- assumes a capacity, a peripheral name or a mount path: every candidate is
+-- discovered by probing and then filtered by the measured archive size.
+--
+-- Returns an array of { path = <absolute path>, free = <bytes> } in this order:
+--   1. attached disk drives, from peripheral.find("drive"/"disk drive");
+--   2. conventional mount points /disk, /disk2 ... /disk9;
+--   3. any other directory under / (or one level deeper) whose reported free
+--      space differs from its parent's - i.e. a separate filesystem.
+-- Returns nil when the fs API cannot report free space at all, in which case
+-- detection is skipped and the installer behaves exactly as before.
+local MAX_MOUNT_DEPTH = 2
+
+local function findStorageCandidates()
+  if type(fs.getFreeSpace) ~= "function" then return nil end
+
+  local seen, out = {}, {}
+
+  local function freeSpace(path)
+    local ok, free = pcall(fs.getFreeSpace, path)
+    if ok and type(free) == "number" then return free end
+    return nil
+  end
+
+  -- Only writable filesystems can hold the install, and this also drops the
+  -- read-only ROM, whose free space reads as 0 and would otherwise look like a
+  -- separate filesystem in step 3 below.
+  local function isWritable(path)
+    if type(fs.isReadOnly) ~= "function" then return true end
+    local ok, ro = pcall(fs.isReadOnly, path)
+    if ok then return not ro end
+    return true
+  end
+
+  -- Normalise to an absolute path with no trailing slash, so the same
+  -- filesystem discovered two ways (e.g. a drive's mount path and /disk) is
+  -- recorded once.
+  local function normalize(path)
+    if path:sub(1, 1) ~= "/" then path = "/" .. path end
+    while #path > 1 and path:sub(-1) == "/" do path = path:sub(1, -2) end
+    return path
+  end
+
+  local function add(path)
+    if type(path) ~= "string" or path == "" then return end
+    path = normalize(path)
+    if seen[path] then return end
+    local free = freeSpace(path)
+    if free and isWritable(path) then
+      seen[path] = true
+      out[#out + 1] = { path = path, free = free }
+    end
+  end
+
+  -- The disk API is a global, but guard it: older builds and test shims may
+  -- not provide it, and `peripheral.find` itself can be absent.
+  local diskApi = rawget(_G, "disk")
+
+  -- 1. Disk drives. `peripheral.find` returns every matching peripheral as a
+  --    vararg, so collect the whole pcall result (element 1 is the ok flag).
+  if peripheral and type(peripheral.find) == "function" then
+    for _, kind in ipairs({ "drive", "disk drive" }) do
+      local found = { pcall(peripheral.find, kind) }
+      if found[1] then
+        for i = 2, #found do
+          local drive = found[i]
+          local name
+          if type(peripheral.getName) == "function" then
+            local ok, n = pcall(peripheral.getName, drive)
+            if ok then name = n end
+          end
+          if name == nil and type(drive) == "table" then name = drive.name end
+          if name ~= nil and diskApi and type(diskApi.hasData) == "function" then
+            local ok, has = pcall(diskApi.hasData, name)
+            if ok and has and type(diskApi.getMountPath) == "function" then
+              local okp, mount = pcall(diskApi.getMountPath, name)
+              if okp and type(mount) == "string" then add(mount) end
+            end
+          end
+        end
+      end
+    end
+  end
+
+  -- 2. Conventional mount points used by CC's disk API and by hand.
+  for i = 1, 9 do
+    local path = i == 1 and "/disk" or ("/disk" .. i)
+    local ok, isDir = pcall(fs.isDir, path)
+    if ok and isDir then add(path) end
+  end
+
+  -- 3. Generic mount discovery. A mounted filesystem shares /'s directory
+  --    listing but reports its own free space, so compare each directory's
+  --    free space with its parent's. Probe one level deeper for a mount nested
+  --    in a plain directory; the depth limit stops any runaway recursion.
+  local rootFree = freeSpace("/")
+  local function probe(dir, depth, parentFree)
+    if depth > MAX_MOUNT_DEPTH then return end
+    local ok, entries = pcall(fs.list, dir)
+    if not ok or type(entries) ~= "table" then return end
+    for _, name in ipairs(entries) do
+      local child = (dir == "/" and "" or dir) .. "/" .. name
+      local okd, isDir = pcall(fs.isDir, child)
+      if okd and isDir then
+        local free = freeSpace(child)
+        if free then
+          if parentFree ~= nil and free ~= parentFree then add(child) end
+          probe(child, depth + 1, free)
+        end
+      end
+    end
+  end
+  if rootFree ~= nil then probe("/", 1, rootFree) end
+
+  return out
+end
+
+-- Decide where to install, given the measured archive size. Returns a root
+-- that always ends in "/" (the internal disk as a fallback). An explicit
+-- argv[2] wins outright; otherwise the first candidate with enough free space
+-- is offered once with a [y/N] prompt (default NO). Candidates that do not fit
+-- are still printed, so the user can see why the internal disk was kept.
+local function chooseStorage(needed)
+  if explicitRoot then
+    pcall(mkdirp, explicitRoot)
+    log("Using the install root from the command line: %s", explicitRoot)
+    return explicitRoot
+  end
+
+  local candidates = findStorageCandidates()
+  if not candidates or #candidates == 0 then return internalRoot end
+
+  print("")
+  print("Other storage found (the client needs about " .. needed .. " bytes):")
+  local fitPath, fitFree
+  for _, c in ipairs(candidates) do
+    local fits = c.free >= needed
+    if fits and not fitPath then fitPath, fitFree = c.path, c.free end
+    print(("  %-10s %d bytes free%s"):format(c.path, c.free, fits and "  (fits)" or ""))
+  end
+  print("")
+
+  if not fitPath then
+    print("None of those has enough room; using the internal disk instead.")
+    print("")
+    return internalRoot
+  end
+
+  write(("Install onto %s instead of the internal disk (%d bytes free)? [y/N] ")
+    :format(fitPath, fitFree))
+  local ans = read and read() or nil
+  if type(ans) == "string" and ans:match("^[yY]") then
+    local chosen = fitPath
+    if chosen:sub(-1) ~= "/" then chosen = chosen .. "/" end
+    return chosen
+  end
+  print("Keeping the internal disk.")
+  return internalRoot
 end
 
 -- Plain single-response GET via the built-in http API, with a few retries.
@@ -336,29 +531,22 @@ end
 pickSource()
 
 -- --------------------------------------------------------------------- main
-local root = CONFIG.root
-if root:sub(-1) ~= "/" then root = root .. "/" end
-local target = root .. "ccncm"
-
 log("CC-CloudMusicNCM installer for CC:Tweaked")
 log("  bundle : %s/%s", CONFIG.base, CONFIG.bundle)
-log("  target : %s/", target)
 
--- 1. remove any previous install so re-running is idempotent.
-log("[1/4] Removing previous install (if any) ...")
-rmrf(target)
-
--- 2. download each candidate bundle into memory, measure the archive that was
--- just downloaded, check that it fits, and only then extract it. The size MUST
--- come from the archive itself: a hardcoded byte count goes stale as soon as
--- the bundle changes, and it cannot account for CC charging disk per file.
+-- Download each candidate bundle into memory, measure the archive that was
+-- just downloaded, pick the install root from the measured size, check that the
+-- bundle fits there, and only then extract it. The size MUST come from the
+-- archive itself: a hardcoded byte count goes stale as soon as the bundle
+-- changes, and it cannot account for CC charging disk per file.
 local sources = { CONFIG.base }
 for _, m in ipairs(MIRRORS) do
   if m.base ~= CONFIG.base then sources[#sources + 1] = m.base end
 end
 
-log("[2/3] Downloading and extracting ...")
+log("[1/4] Downloading and measuring the bundle ...")
 local installed = false
+local installRoot, installTarget, removedPrev
 for i = 1, #sources do
   local base = sources[i]
   log("  source %d/%d: %s", i, #sources, base)
@@ -376,39 +564,57 @@ for i = 1, #sources do
     log("  archive: %d entries, %d bytes (needs about %d with per-file overhead)",
       entries, totalBytes, needed)
 
-    if fs.getFreeSpace then
-      local free = fs.getFreeSpace(root)
+    -- Pick the target once we know how much room the archive needs. The choice
+    -- is remembered so a mirror retry never asks again.
+    if not installRoot then
+      installRoot = chooseStorage(needed)
+      installTarget = installRoot .. "ccncm"
+      log("  target : %s", installTarget)
+    end
+
+    -- Remove any previous install of the chosen target so re-running is
+    -- idempotent. Only <target>ccncm is ever touched.
+    if not removedPrev then
+      log("[2/4] Removing previous install (if any) ...")
+      rmrf(installTarget)
+      removedPrev = true
+    end
+
+    if type(fs.getFreeSpace) == "function" then
+      local free = fs.getFreeSpace(installRoot)
       log("  free space: %d bytes", free)
       if free < needed then
-        die(string.format(
-          "not enough disk space: %d bytes free, this archive needs about %d bytes (%d entries).\n"
-            .. "  Delete files on the computer, or raise computer_space_limit in\n"
-            .. "  config/computercraft-server.toml (then restart the world), and retry.",
-          free, needed, entries))
+        local msg = ("not enough disk space: %d bytes free, this archive needs about %d bytes (%d entries)."):format(
+          free, needed, entries)
+        if installRoot == internalRoot then
+          msg = msg .. "\n  Delete files on the computer, or raise computer_space_limit in\n"
+            .. "  config/computercraft-server.toml (then restart the world), and retry."
+        end
+        die(msg)
       end
     end
 
-    local files = extractTar(body, root)
+    local files = extractTar(body, installRoot)
     log("  extracted %d files", files)
 
-    if fs.exists(target .. "/startup.lua")
-      and fs.exists(target .. "/Lib/basalt.lua")
-      and fs.exists(target .. "/Lib/utf8display.lua")
-      and fs.exists(target .. "/icons/Home.lua") then
+    if fs.exists(installTarget .. "/startup.lua")
+      and fs.exists(installTarget .. "/Lib/basalt.lua")
+      and fs.exists(installTarget .. "/Lib/utf8display.lua")
+      and fs.exists(installTarget .. "/icons/Home.lua") then
       installed = true
       if i > 1 then log("  note: the chosen source failed; using another mirror") end
       break
     end
     log("  bundle incomplete; trying another mirror ...")
-    rmrf(target)
+    rmrf(installTarget)
   end
 end
 if not installed then
   die("could not install a complete bundle from any mirror")
 end
 
--- 3. verify the files startup.lua loads and print the run instruction.
-log("[3/3] Verifying ...")
+-- Verify the files startup.lua loads and print the run instruction.
+log("[3/4] Verifying ...")
 local checks = {
   "startup.lua",
   "Lib/basalt.lua",
@@ -417,17 +623,24 @@ local checks = {
 }
 local allOk = true
 for _, rel in ipairs(checks) do
-  local ok = fs.exists(target .. "/" .. rel)
+  local ok = fs.exists(installTarget .. "/" .. rel)
   log("  %s %s", ok and "OK  " or "MISS", rel)
   if not ok then allOk = false end
 end
 if not allOk then
-  die("verification failed: a required file did not land under " .. target)
+  die("verification failed: a required file did not land under " .. installTarget)
 end
 
+-- The run command is relative to / so it works from the default shell prompt.
+-- Requires are resolved relative to the program's own directory, so the client
+-- must always be launched by a path that reaches it.
+local runPrefix = installRoot == "/" and "" or installRoot:sub(2)
+local runCmd = runPrefix .. "ccncm/startup"
+
 log("")
-log("Done. CC-CloudMusicNCM is installed at %s/", target)
+log("[4/4] Done. CC-CloudMusicNCM is installed at %s", installTarget)
 log("Run it as:")
-log("  ccncm/startup")
-log("from the directory that contains ccncm/ (the default install root is /).")
-log("For example, at the shell prompt in /, type: ccncm/startup")
+log("  %s", runCmd)
+log("from the shell prompt in / (the command path is relative to /).")
+log("Its requires resolve relative to the program directory, so launch it by")
+log("this path (or a full path to %s/startup.lua).", installTarget)

@@ -77,6 +77,53 @@ Select [1]:
 wget run <上面的 install.lua URL> https://my.mirror/ccncm
 ```
 
+#### 安装到磁盘驱动器 / 已挂载的文件系统
+
+电脑自身的磁盘只有约 1 MB,往往放不下客户端。安装器在**写入任何文件之前**
+会先下载并测量压缩包,然后探测是否有足够的其它存储可用:
+
+- **磁盘驱动器**:`peripheral.find("drive")` 与 `peripheral.find("disk drive")`
+  两种外设名都试;对每个驱动器用 `disk.hasData` 判断是否插了盘,再用
+  `disk.getMountPath` 取得挂载路径。
+- **约定挂载点**:依次探测 `/disk`、`/disk2` … `/disk9`(`fs.isDir`)。
+- **通用挂载发现**:遍历 `fs.list("/")`,若某个目录的 `fs.getFreeSpace`
+  与 `/` 的不同,就认为它是一块独立文件系统(这正是 ROM 的 `mount` 程序
+  挂载目录后的表现);还会再深入一层,寻找嵌套在普通目录里的挂载,并带深度
+  上限。所有调用都用 `pcall` 保护,旧版本缺少 `fs.getFreeSpace` 时直接跳过
+  探测、行为与以前完全一致。
+
+探测到的每个候选都会连同剩余空间一起打印,例如:
+
+```
+Other storage found (the client needs about 418109 bytes):
+  /disk      4194304 bytes free  (fits)
+  /disk2        20000 bytes free
+```
+
+- 只要**有一个**候选放得下,就会**只问一次**、默认否:
+
+  ```
+  Install onto /disk instead of the internal disk (4194304 bytes free)? [y/N]
+  ```
+
+  以 `y`/`Y` 开头表示同意;直接回车或其它输入则使用内置磁盘。
+- 若**没有任何**候选放得下,则打印候选列表后回退到内置磁盘,由原有的
+  “剩余空间 vs 所需大小”检查给出带具体数字的错误(不会留下半截安装)。
+- 安装到驱动器时,客户端位于 `<挂载点>/ccncm`(如 `/disk/ccncm`);
+  “删除旧版本”这一步**只**删除该目标下的 `ccncm`,不会碰别的东西。
+  完成提示里的运行方式会相应变化,例如内置磁盘是 `ccncm/startup`,
+  `/disk` 上是 `disk/ccncm/startup`(require 是相对程序目录解析的,
+  必须以能到达该目录的路径启动)。
+
+若要**跳过上面这个询问**并强制指定安装根目录,把它作为**第二个参数**传入即可
+(末尾斜杠可省略,会自动补全;第一参数仍是下载源):
+
+```
+wget run <上面的 install.lua URL> https://my.mirror/ccncm /disk
+```
+
+指定第二个参数后不再探测、也不再询问,但仍会用所选根目录做剩余空间检查。
+
 ### 手动安装
 
 1. 按 `netease-ncm-lua` 的说明在电脑上装好 `ncm`(会落到 `/ncm`)。
