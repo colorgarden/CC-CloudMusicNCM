@@ -159,6 +159,135 @@ local function rmrf(p)
   end
 end
 
+-- ------------------------------------------------------------------ progress
+-- One-line ASCII progress bar, redrawn in place on its own row.
+--
+-- Every write is clamped to width-1 columns: writing the bottom-right cell of
+-- a terminal scrolls it, which would scroll the bar off the screen. On CC each
+-- terminal write is expensive, so a redraw is throttled to PROGRESS_INTERVAL ms
+-- (the first frame of a new label and the final 100% frame are always drawn).
+local PROGRESS_INTERVAL = 250
+local PROGRESS_BAR = 18
+
+local lastDraw, lastLabel, progressRow = 0, nil, nil
+
+local function humanBytes(n)
+  if n >= 1024 * 1024 then return ("%.2f MB"):format(n / (1024 * 1024)) end
+  if n >= 1024 then return ("%.2f KB"):format(n / 1024) end
+  return tostring(n) .. " B"
+end
+
+-- label : "Download" / "Extract". total nil or 0 drops the bar and percentage
+-- and prints just the label and detail (e.g. "Download 53.21 KB").
+local function drawProgress(label, done, total, detail)
+  local now = os.epoch("utc")
+  local pct
+  if total and total > 0 then
+    pct = math.floor(done * 100 / total)
+    if pct > 100 then pct = 100 end
+  end
+  local final = pct ~= nil and pct >= 100
+  if label == lastLabel and not final and now - lastDraw < PROGRESS_INTERVAL then
+    return false
+  end
+  if label ~= lastLabel then
+    -- A new phase takes over the row the cursor is on now and keeps drawing
+    -- there, so a bar never marches down the screen.
+    progressRow = select(2, term.getCursorPos())
+    lastLabel = label
+    lastDraw = 0
+  end
+  lastDraw = now
+
+  local text
+  if pct then
+    local filled = math.floor(pct * PROGRESS_BAR / 100)
+    if filled > PROGRESS_BAR then filled = PROGRESS_BAR end
+    local bar = string.rep("#", filled) .. string.rep("-", PROGRESS_BAR - filled)
+    text = ("%-8s [%s] %3d%%  %s"):format(label, bar, pct, detail or "")
+  else
+    text = ("%s %s"):format(label, detail or "")
+  end
+
+  local w = select(1, term.getSize())
+  if #text > w - 1 then text = text:sub(1, w - 1) end
+  term.setCursorPos(1, progressRow)
+  term.clearLine()
+  write(text)
+  return final == true
+end
+
+-- Erase the bar before normal output so no log line is glued to it, leaving
+-- the cursor on the bar's own row for the next print.
+local function finishProgress()
+  if progressRow then
+    term.setCursorPos(1, progressRow)
+    term.clearLine()
+  end
+  lastDraw, lastLabel, progressRow = 0, nil, nil
+end
+
+-- content-length from the response headers, matched case-insensitively. nil
+-- when the server did not send one (the bar then shows the byte count only).
+local function contentLength(handle)
+  if type(handle.getResponseHeaders) ~= "function" then return nil end
+  local ok, headers = pcall(handle.getResponseHeaders)
+  if not ok or type(headers) ~= "table" then return nil end
+  for key, value in pairs(headers) do
+    if type(key) == "string" and key:lower() == "content-length" then
+      local n = tonumber(value)
+      if n and n > 0 then return n end
+    end
+  end
+  return nil
+end
+
+-- Read a single-response body in chunks, drawing the download bar as it
+-- arrives, and return the whole body. CC:Tweaked's read(n) blocks until n
+-- bytes or EOF and returns nil at EOF, so the bar follows the network.
+-- CraftOS-PC's read(n) is a non-blocking readsome() that can return "" once it
+-- has drained its buffer; the first empty read falls back to readAll() (which
+-- blocks until the rest is buffered) so the installer still terminates with
+-- the whole archive.
+local DOWNLOAD_CHUNK = 32768
+
+local function readBodyProgress(handle, label)
+  local total = contentLength(handle)
+  local out, got, drewFinal = {}, 0, false
+  if type(handle.read) == "function" then
+    while true do
+      local chunk = handle.read(DOWNLOAD_CHUNK)
+      if chunk == nil then break end
+      if #chunk == 0 then
+        if type(handle.readAll) == "function" then
+          local rest = handle.readAll() or ""
+          if #rest > 0 then
+            out[#out + 1] = rest
+            got = got + #rest
+            drewFinal = drawProgress(label, got, total, humanBytes(got))
+          end
+        end
+        break
+      end
+      out[#out + 1] = chunk
+      got = got + #chunk
+      drewFinal = drawProgress(label, got, total, humanBytes(got))
+    end
+  end
+  if got == 0 and type(handle.readAll) == "function" then
+    local body = handle.readAll() or ""
+    if #body > 0 then
+      drawProgress(label, #body, total, humanBytes(#body))
+      return body, #body
+    end
+  end
+  if total and total > 0 and not drewFinal then
+    -- Guarantee a clean final frame even if the last draws were throttled.
+    drawProgress(label, total, total, humanBytes(total))
+  end
+  return table.concat(out), got
+end
+
 -- ------------------------------------------------------------ storage probe
 -- Look for a filesystem other than the internal disk that the client could be
 -- installed onto (a disk drive or a directory the ROM mounted). Nothing here
@@ -340,51 +469,6 @@ local function plainGet(url)
   return nil, lastErr
 end
 
--- Wrap a binary HTTP handle so `read(n)` behaves the way readBody() above
--- expects: blocking, returning nil only at end of stream.
---
--- CC:Tweaked's http handle already does this. CraftOS-PC does not: there
--- `read(n)` is a non-blocking readsome() that can return "" while the body is
--- still downloading, so a plain read loop would stop at the first header and
--- buffer nothing. On the first empty read we fall back to readAll(), which
--- blocks until the whole (small, ~450 KB) response is buffered, and then serve
--- the remaining reads from memory.
-local function blockingHandle(handle)
-  local body, pos = nil, 1
-  return {
-    read = function(n)
-      if body then
-        if pos > #body then return nil end
-        local chunk = body:sub(pos, pos + n - 1)
-        pos = pos + #chunk
-        return chunk
-      end
-      local chunk = handle.read(n)
-      if chunk ~= nil and #chunk == 0 then
-        body = handle.readAll() or ""
-        if pos > #body then return nil end
-        chunk = body:sub(pos, pos + n - 1)
-        pos = pos + #chunk
-      end
-      return chunk
-    end,
-  }
-end
-
--- Read the whole (small, single-response) body into one Lua string before
--- measuring or extracting it. blockingHandle() makes read(n) blocking, so this
--- loop terminates only at end of stream, and the archive never touches disk.
-local function readBody(handle)
-  local h = blockingHandle(handle)
-  local out = {}
-  while true do
-    local chunk = h.read(65536)
-    if not chunk or #chunk == 0 then break end
-    out[#out + 1] = chunk
-  end
-  return table.concat(out)
-end
-
 -- CC:Tweaked charges every file its contents plus the length of its path (and a
 -- little metadata), which the USTAR size fields do not include. This is a
 -- per-entry allowance for that bookkeeping, NOT a size threshold: the byte
@@ -443,8 +527,8 @@ end
 -- Pass 2: extract an in-memory USTAR archive under `root`. This is the same
 -- walk measureTar() uses, and it runs only after the free-space check passes,
 -- so nothing is written before the check.
-local function extractTar(body, root)
-  local count, pos = 0, 1
+local function extractTar(body, root, entries)
+  local count, pos, done = 0, 1, 0
   while pos + 511 <= #body do
     local hdr = body:sub(pos, pos + 511)
     local name, full, size, typeflag = tarHeader(hdr)
@@ -459,8 +543,11 @@ local function extractTar(body, root)
       f.close()
       count = count + 1
     end
+    done = done + 1
+    drawProgress("Extract", done, entries, ("%d/%d files"):format(done, entries or 0))
     pos = pos + math.ceil(size / 512) * 512
   end
+  finishProgress()
   return count
 end
 
@@ -606,8 +693,9 @@ local function installBasalt(sources)
     log("  source %d/%d: %s", i, #sources, base)
     local handle, err = plainGet(base .. "/" .. CONFIG.libBundle)
     if handle then
-      body = readBody(handle)
+      body = readBodyProgress(handle, "Download")
       handle.close()
+      finishProgress()
       break
     end
     log("  download failed: %s", tostring(err))
@@ -639,7 +727,7 @@ local function installBasalt(sources)
     end
   end
 
-  local files = extractTar(body, internalRoot)
+  local files = extractTar(body, internalRoot, entries)
   log("  extracted %d files", files)
   if not fs.exists(BASALT_PATH) then
     die("extraction finished but " .. BASALT_PATH .. " is missing")
@@ -665,8 +753,9 @@ local function installClient(sources)
       log("  download failed: %s", tostring(err))
     else
       -- Buffer the whole archive, then measure it BEFORE writing a single byte.
-      local body = readBody(handle)
+      local body = readBodyProgress(handle, "Download")
       handle.close()
+      finishProgress()
 
       local totalBytes, entries = measureTar(body)
       local needed = totalBytes + entries * PER_ENTRY_OVERHEAD
@@ -704,7 +793,7 @@ local function installClient(sources)
         end
       end
 
-      local files = extractTar(body, installRoot)
+      local files = extractTar(body, installRoot, entries)
       log("  extracted %d files", files)
 
       if fs.exists(installTarget .. "/startup.lua")
