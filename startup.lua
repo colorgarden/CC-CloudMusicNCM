@@ -29,6 +29,23 @@ local function fail(msg)
   print("See README.md for installation instructions.")
 end
 
+-- Optional: draw on an attached monitor instead of the computer's own screen.
+-- Basalt needs a colour terminal with graphics support, which a monitor may or
+-- may not provide, so this is attempted defensively and reverted on failure.
+local monitor
+if peripheral and type(peripheral.find) == "function" then
+  monitor = peripheral.find("monitor")
+end
+if monitor then
+  -- The layout is 51x19, so scale 1 is far too coarse on a monitor.
+  pcall(function() monitor.setTextScale(0.5) end)
+  if not pcall(function() term.redirect(monitor) end) then
+    monitor = nil
+  else
+    print("Rendering on the attached monitor.")
+  end
+end
+
 local okApp, app = pcall(require, "ccncm.app")
 if not okApp then
   fail(app)
@@ -36,6 +53,13 @@ if not okApp then
 end
 
 local okBuild, built, buildErr = pcall(app.build)
+if (not okBuild or built == false or built == nil) and monitor then
+  -- The monitor could not host the UI (Basalt wants a colour graphics
+  -- terminal). Fall back to the computer's own screen and try once more.
+  pcall(function() term.redirect(term.native()) end)
+  monitor = nil
+  okBuild, built, buildErr = pcall(app.build)
+end
 if not okBuild then
   fail(built)
   return
