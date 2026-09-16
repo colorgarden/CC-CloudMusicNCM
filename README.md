@@ -97,7 +97,7 @@ wget run <上面的 install.lua URL> https://my.mirror/ccncm
 ```
 Other storage found (the client needs about 418109 bytes):
   /disk      4194304 bytes free  (fits)
-  /disk2        20000 bytes free
+  /disk2     20000 bytes free
 ```
 
 - 只要**有一个**候选放得下,就会**只问一次**、默认否:
