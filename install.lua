@@ -3,29 +3,41 @@
   NetEase Cloud Music client (Basalt UI + utf8display CJK bitmaps).
 
   What it does
-    1. checks that the `ncm` library is installed at /ncm; when it is missing,
+    0. checks that the `ncm` library is installed at /ncm; when it is missing,
        offers to download and run the library installer through the ghproxy
        mirror and, once /ncm/init.lua exists, continues automatically,
-    2. picks an install root: the internal disk by default, or a disk drive /
-       mounted filesystem with room for the archive, offered once (see Storage),
+    1. installs the shared Basalt UI framework ONCE on the internal disk at
+       /Lib/basalt.lua (stage A).  If it is already there the download is
+       skipped; if it cannot fit, the client stage never runs,
+    2. picks a client install root: the internal disk by default, or a disk
+       drive / mounted filesystem with room for the client archive, offered
+       once (see Storage),
     3. removes any previous <root>ccncm install,
     4. downloads dist/ccncm.tar fully into memory, measures what it needs,
        checks free space on the chosen root against that measured figure, and
        only then extracts it (uncompressed USTAR - no gzip library or temp file),
     5. verifies the files that the client's startup.lua requires.
 
-  Layout (the bundle's entries are already rooted at `ccncm/`):
+  Layout (the client bundle's entries are already rooted at `ccncm/`):
 
+      /Lib/basalt.lua           shared Basalt UI framework (once, internal)
       /ccncm/startup.lua        entry point
       /ccncm/ccncm/*.lua        Basalt UI, data layer, strings
-      /ccncm/Lib/*.lua          Basalt, utf8display, json
+      /ccncm/Lib/utf8display.lua  CJK dot-matrix renderer
       /ccncm/icons/*.lua        icon bitmaps
-      /ccncm/README.md, /ccncm/LICENSE
+      /ccncm/LICENSE
+
+  Basalt is ~330 KB and is by far the largest dependency, so it is installed
+  once at the absolute path /Lib/basalt.lua and shared.  startup.lua already
+  sets package.path = "/?.lua;/?/init.lua;" .. package.path, so
+  require("Lib.basalt") matches /Lib/basalt.lua with no client change; that is
+  also why the small client may live on a disk drive or a mounted filesystem.
 
   The root matters: startup.lua uses require("Lib.basalt"), require("ccncm.app")
   and require("icons.Home"), which CraftOS resolves relative to the running
-  program's directory. So the client must be launched as `ccncm/startup` from
-  the directory that contains `ccncm/` (by default `/`).
+  program's directory (with the absolute patterns above checked first). So the
+  client must be launched as `ccncm/startup` from the directory that contains
+  `ccncm/` (by default `/`).
 
   Requirements
     * An Advanced Computer (or Command Computer) with the HTTP API enabled.
@@ -39,14 +51,14 @@
     -- pass a bundle base URL as the first argument to skip the menu:
     wget run <url> https://my.mirror/ccncm
 
-    -- a second argument fixes the install root and skips the disk prompt
-    -- (a trailing slash is optional and normalised):
+    -- a second argument fixes the client install root and skips the disk
+    -- prompt (a trailing slash is optional and normalised):
     wget run <url> https://my.mirror/ccncm /disk
 
   Storage
     The client is installed under `<root>ccncm`, where `<root>` is the
     internal disk (`/`) by default. Before writing anything, the installer
-    probes for filesystems that have room for the measured archive:
+    probes for filesystems that have room for the measured client archive:
       * disk drives reported by `peripheral.find("drive")` /
         `peripheral.find("disk drive")`,
       * the conventional mount points `/disk`, `/disk2` ... `/disk9`,
@@ -55,23 +67,32 @@
     Each existing candidate is listed with its free space; if one fits, the
     installer asks once (default NO) and otherwise falls back to the internal
     disk, whose normal computed free-vs-needed check then decides. No drive
-    names, capacities or mount paths are assumed anywhere.
+    names, capacities or mount paths are assumed anywhere. Basalt always goes
+    to the internal disk and is never installed on a removable drive.
 ]]
 
 local CONFIG = {
-  -- Where dist/ccncm.tar is served from (overridable by argv[1]).
+  -- Where the dist/ archives are served from (overridable by argv[1]).
   base = "https://cdn.jsdelivr.net/gh/colorgarden/CC-CloudMusicNCM@main",
   -- Where ccncm/ is installed (must end with "/").
   root = "/",
-  -- Bundle path relative to the base URL.
+  -- Client bundle path relative to the base URL.
   bundle = "dist/ccncm.tar",
+  -- Shared Basalt framework bundle path relative to the base URL.
+  libBundle = "dist/ccncm-lib.tar",
 }
+
+-- The shared framework always lives here (absolute), and the lib bundle roots
+-- its single entry at Lib/ so extracting at "/" lands exactly this path.
+local BASALT_PATH = "/Lib/basalt.lua"
+local BASALT_ENTRY = "Lib/basalt.lua"
 
 local args = { ... }
 
--- Optional argv[2]: an explicit install root. When present, disk detection and
--- the interactive prompt are skipped. A trailing slash is optional; it is
--- normalised here so the rest of the installer can always append "ccncm".
+-- Optional argv[2]: an explicit client install root. When present, disk
+-- detection and the interactive prompt are skipped. A trailing slash is
+-- optional; it is normalised here so the rest of the installer can always
+-- append "ccncm".
 local explicitRoot
 if args[2] and args[2] ~= "" then
   explicitRoot = args[2]
@@ -257,8 +278,8 @@ local function findStorageCandidates()
   return out
 end
 
--- Decide where to install, given the measured archive size. Returns a root
--- that always ends in "/" (the internal disk as a fallback). An explicit
+-- Decide where to install the client, given the measured archive size. Returns
+-- a root that always ends in "/" (the internal disk as a fallback). An explicit
 -- argv[2] wins outright; otherwise the first candidate with enough free space
 -- is offered once with a [y/N] prompt (default NO). Candidates that do not fit
 -- are still printed, so the user can see why the internal disk was kept.
@@ -405,6 +426,20 @@ local function measureTar(body)
   return total, entries
 end
 
+-- True when the archive carries a regular-file entry whose full path is `want`.
+-- Used to confirm the lib bundle really contains Lib/basalt.lua before writing.
+local function tarHasEntry(body, want)
+  local pos = 1
+  while pos + 511 <= #body do
+    local hdr = body:sub(pos, pos + 511)
+    local name, full, size, typeflag = tarHeader(hdr)
+    if name == "" then break end -- end-of-archive marker
+    if full == want and typeflag ~= "5" then return true end
+    pos = pos + 512 + math.ceil(size / 512) * 512
+  end
+  return false
+end
+
 -- Pass 2: extract an in-memory USTAR archive under `root`. This is the same
 -- walk measureTar() uses, and it runs only after the free-space check passes,
 -- so nothing is written before the check.
@@ -427,6 +462,15 @@ local function extractTar(body, root)
     pos = pos + math.ceil(size / 512) * 512
   end
   return count
+end
+
+-- True when the shared framework is present, either at the absolute shared
+-- path or as a copy sitting next to the client. startup.lua's
+-- package.path = "/?.lua;/?/init.lua;" .. ... makes require("Lib.basalt")
+-- match /Lib/basalt.lua first, then the relative Lib/basalt.lua via the default
+-- patterns, so either location works.
+local function basaltAvailable(target)
+  return fs.exists(BASALT_PATH) or fs.exists(target .. "/Lib/basalt.lua")
 end
 
 -- ---------------------------------------------------------------- ncm pre-check
@@ -519,7 +563,7 @@ local function pickSource()
     CONFIG.base = MIRRORS[n].base
     print("Selected: " .. MIRRORS[n].name)
   elseif n == #MIRRORS + 1 then
-    local u = ask("Bundle base URL (the dir containing dist/ccncm.tar): ")
+    local u = ask("Bundle base URL (the dir containing dist/): ")
     if u ~= "" then CONFIG.base = u:gsub("/+$", "") end
     print("Using custom source")
   else
@@ -530,117 +574,204 @@ end
 
 pickSource()
 
--- --------------------------------------------------------------------- main
-log("CC-CloudMusicNCM installer for CC:Tweaked")
-log("  bundle : %s/%s", CONFIG.base, CONFIG.bundle)
+-- ------------------------------------------------------------- stage A: Basalt
+-- Install the shared Basalt UI framework once, on the internal disk only.
+--
+-- Basalt is the single biggest file the client needs (~330 KB of the ~415 KB
+-- client), so keeping it out of the client bundle is what lets the client fit
+-- on a 125 KB floppy or a disk drive. It is idempotent: when /Lib/basalt.lua
+-- already exists (and is non-empty) the download is skipped entirely, and
+-- nothing fancier than existence plus that sanity check is compared. If the
+-- framework cannot fit, the client stage must not run.
+local function installBasalt(sources)
+  log("[1/5] Shared Basalt UI framework at %s ...", BASALT_PATH)
 
--- Download each candidate bundle into memory, measure the archive that was
--- just downloaded, pick the install root from the measured size, check that the
--- bundle fits there, and only then extract it. The size MUST come from the
+  if fs.exists(BASALT_PATH) then
+    local size
+    if type(fs.getSize) == "function" then
+      local ok, sz = pcall(fs.getSize, BASALT_PATH)
+      if ok and type(sz) == "number" then size = sz end
+    end
+    if size == nil or size > 0 then
+      log("  already present%s; not downloading it again.",
+        size and (" (" .. size .. " bytes)") or "")
+      return
+    end
+    log("  found an empty %s; reinstalling it.", BASALT_PATH)
+  end
+
+  local body
+  for i = 1, #sources do
+    local base = sources[i]
+    log("  source %d/%d: %s", i, #sources, base)
+    local handle, err = plainGet(base .. "/" .. CONFIG.libBundle)
+    if handle then
+      body = readBody(handle)
+      handle.close()
+      break
+    end
+    log("  download failed: %s", tostring(err))
+  end
+  if not body then
+    die("could not download " .. CONFIG.libBundle .. " from any mirror")
+  end
+
+  -- The lib bundle must contain exactly the shared framework; refuse anything
+  -- that does not (guards against serving the wrong file from a stale mirror).
+  if not tarHasEntry(body, BASALT_ENTRY) then
+    die(CONFIG.libBundle .. " does not contain " .. BASALT_ENTRY)
+  end
+
+  local totalBytes, entries = measureTar(body)
+  local needed = totalBytes + entries * PER_ENTRY_OVERHEAD
+  log("  archive: %d entries, %d bytes (needs about %d with per-file overhead)",
+    entries, totalBytes, needed)
+
+  if type(fs.getFreeSpace) == "function" then
+    local free = fs.getFreeSpace(internalRoot)
+    log("  free space on %s: %d bytes", internalRoot, free)
+    if free < needed then
+      die(("not enough disk space for the shared framework: %d bytes free, this archive "
+        .. "needs about %d bytes (%d entries).\n"
+        .. "  Delete files on the computer, or raise computer_space_limit in\n"
+        .. "  config/computercraft-server.toml (then restart the world), and retry.")
+        :format(free, needed, entries))
+    end
+  end
+
+  local files = extractTar(body, internalRoot)
+  log("  extracted %d files", files)
+  if not fs.exists(BASALT_PATH) then
+    die("extraction finished but " .. BASALT_PATH .. " is missing")
+  end
+end
+
+-- -------------------------------------------------------------- stage B: client
+-- Download each candidate client bundle into memory, measure the archive that
+-- was just downloaded, pick the install root from the measured size, check that
+-- the bundle fits there, and only then extract it. The size MUST come from the
 -- archive itself: a hardcoded byte count goes stale as soon as the bundle
 -- changes, and it cannot account for CC charging disk per file.
+local function installClient(sources)
+  log("[2/5] Downloading and measuring the client bundle ...")
+  local installed = false
+  local installRoot, installTarget, removedPrev
+  for i = 1, #sources do
+    local base = sources[i]
+    log("  source %d/%d: %s", i, #sources, base)
+
+    local handle, err = plainGet(base .. "/" .. CONFIG.bundle)
+    if not handle then
+      log("  download failed: %s", tostring(err))
+    else
+      -- Buffer the whole archive, then measure it BEFORE writing a single byte.
+      local body = readBody(handle)
+      handle.close()
+
+      local totalBytes, entries = measureTar(body)
+      local needed = totalBytes + entries * PER_ENTRY_OVERHEAD
+      log("  archive: %d entries, %d bytes (needs about %d with per-file overhead)",
+        entries, totalBytes, needed)
+
+      -- Pick the target once we know how much room the archive needs. The choice
+      -- is remembered so a mirror retry never asks again.
+      if not installRoot then
+        installRoot = chooseStorage(needed)
+        installTarget = installRoot .. "ccncm"
+        log("  target : %s", installTarget)
+      end
+
+      -- Remove any previous install of the chosen target so re-running is
+      -- idempotent. Only <target>ccncm is ever touched; the shared
+      -- /Lib/basalt.lua is never removed.
+      if not removedPrev then
+        log("[3/5] Removing previous client install (if any) ...")
+        rmrf(installTarget)
+        removedPrev = true
+      end
+
+      if type(fs.getFreeSpace) == "function" then
+        local free = fs.getFreeSpace(installRoot)
+        log("  free space: %d bytes", free)
+        if free < needed then
+          local msg = ("not enough disk space: %d bytes free, this archive needs about %d bytes (%d entries)."):format(
+            free, needed, entries)
+          if installRoot == internalRoot then
+            msg = msg .. "\n  Delete files on the computer, or raise computer_space_limit in\n"
+              .. "  config/computercraft-server.toml (then restart the world), and retry."
+          end
+          die(msg)
+        end
+      end
+
+      local files = extractTar(body, installRoot)
+      log("  extracted %d files", files)
+
+      if fs.exists(installTarget .. "/startup.lua")
+        and fs.exists(installTarget .. "/Lib/utf8display.lua")
+        and fs.exists(installTarget .. "/icons/Home.lua")
+        and basaltAvailable(installTarget) then
+        installed = true
+        if i > 1 then log("  note: the chosen source failed; using another mirror") end
+        break
+      end
+      log("  bundle incomplete; trying another mirror ...")
+      rmrf(installTarget)
+    end
+  end
+  if not installed then
+    die("could not install a complete bundle from any mirror")
+  end
+
+  -- Verify the files startup.lua loads and print the run instruction.
+  log("[4/5] Verifying ...")
+  local checks = {
+    "startup.lua",
+    "Lib/utf8display.lua",
+    "icons/Home.lua",
+  }
+  local allOk = true
+  for _, rel in ipairs(checks) do
+    local ok = fs.exists(installTarget .. "/" .. rel)
+    log("  %s %s", ok and "OK  " or "MISS", rel)
+    if not ok then allOk = false end
+  end
+  local basaltOk = basaltAvailable(installTarget)
+  log("  %s %s", basaltOk and "OK  " or "MISS",
+    "Lib/basalt.lua (shared at " .. BASALT_PATH .. ")")
+  if not basaltOk then allOk = false end
+  if not allOk then
+    die("verification failed: a required file did not land under " .. installTarget)
+  end
+
+  -- The run command is relative to / so it works from the default shell prompt.
+  -- Requires are resolved relative to the program's own directory, so the client
+  -- must always be launched by a path that reaches it.
+  local runPrefix = installRoot == "/" and "" or installRoot:sub(2)
+  local runCmd = runPrefix .. "ccncm/startup"
+
+  log("")
+  log("[5/5] Done. CC-CloudMusicNCM is installed.")
+  log("  shared framework: %s", BASALT_PATH)
+  log("  client          : %s", installTarget)
+  log("Run it as:")
+  log("  %s", runCmd)
+  log("from the shell prompt in / (the command path is relative to /).")
+  log("Its requires resolve relative to the program directory, so launch it by")
+  log("this path (or a full path to %s/startup.lua).", installTarget)
+end
+
+-- --------------------------------------------------------------------- main
+log("CC-CloudMusicNCM installer for CC:Tweaked")
+log("  lib bundle    : %s/%s", CONFIG.base, CONFIG.libBundle)
+log("  client bundle : %s/%s", CONFIG.base, CONFIG.bundle)
+
+-- Every known mirror is tried in turn for both bundles; the selected source is
+-- first, then the others as fallbacks.
 local sources = { CONFIG.base }
 for _, m in ipairs(MIRRORS) do
   if m.base ~= CONFIG.base then sources[#sources + 1] = m.base end
 end
 
-log("[1/4] Downloading and measuring the bundle ...")
-local installed = false
-local installRoot, installTarget, removedPrev
-for i = 1, #sources do
-  local base = sources[i]
-  log("  source %d/%d: %s", i, #sources, base)
-
-  local handle, err = plainGet(base .. "/" .. CONFIG.bundle)
-  if not handle then
-    log("  download failed: %s", tostring(err))
-  else
-    -- Buffer the whole archive, then measure it BEFORE writing a single byte.
-    local body = readBody(handle)
-    handle.close()
-
-    local totalBytes, entries = measureTar(body)
-    local needed = totalBytes + entries * PER_ENTRY_OVERHEAD
-    log("  archive: %d entries, %d bytes (needs about %d with per-file overhead)",
-      entries, totalBytes, needed)
-
-    -- Pick the target once we know how much room the archive needs. The choice
-    -- is remembered so a mirror retry never asks again.
-    if not installRoot then
-      installRoot = chooseStorage(needed)
-      installTarget = installRoot .. "ccncm"
-      log("  target : %s", installTarget)
-    end
-
-    -- Remove any previous install of the chosen target so re-running is
-    -- idempotent. Only <target>ccncm is ever touched.
-    if not removedPrev then
-      log("[2/4] Removing previous install (if any) ...")
-      rmrf(installTarget)
-      removedPrev = true
-    end
-
-    if type(fs.getFreeSpace) == "function" then
-      local free = fs.getFreeSpace(installRoot)
-      log("  free space: %d bytes", free)
-      if free < needed then
-        local msg = ("not enough disk space: %d bytes free, this archive needs about %d bytes (%d entries)."):format(
-          free, needed, entries)
-        if installRoot == internalRoot then
-          msg = msg .. "\n  Delete files on the computer, or raise computer_space_limit in\n"
-            .. "  config/computercraft-server.toml (then restart the world), and retry."
-        end
-        die(msg)
-      end
-    end
-
-    local files = extractTar(body, installRoot)
-    log("  extracted %d files", files)
-
-    if fs.exists(installTarget .. "/startup.lua")
-      and fs.exists(installTarget .. "/Lib/basalt.lua")
-      and fs.exists(installTarget .. "/Lib/utf8display.lua")
-      and fs.exists(installTarget .. "/icons/Home.lua") then
-      installed = true
-      if i > 1 then log("  note: the chosen source failed; using another mirror") end
-      break
-    end
-    log("  bundle incomplete; trying another mirror ...")
-    rmrf(installTarget)
-  end
-end
-if not installed then
-  die("could not install a complete bundle from any mirror")
-end
-
--- Verify the files startup.lua loads and print the run instruction.
-log("[3/4] Verifying ...")
-local checks = {
-  "startup.lua",
-  "Lib/basalt.lua",
-  "Lib/utf8display.lua",
-  "icons/Home.lua",
-}
-local allOk = true
-for _, rel in ipairs(checks) do
-  local ok = fs.exists(installTarget .. "/" .. rel)
-  log("  %s %s", ok and "OK  " or "MISS", rel)
-  if not ok then allOk = false end
-end
-if not allOk then
-  die("verification failed: a required file did not land under " .. installTarget)
-end
-
--- The run command is relative to / so it works from the default shell prompt.
--- Requires are resolved relative to the program's own directory, so the client
--- must always be launched by a path that reaches it.
-local runPrefix = installRoot == "/" and "" or installRoot:sub(2)
-local runCmd = runPrefix .. "ccncm/startup"
-
-log("")
-log("[4/4] Done. CC-CloudMusicNCM is installed at %s", installTarget)
-log("Run it as:")
-log("  %s", runCmd)
-log("from the shell prompt in / (the command path is relative to /).")
-log("Its requires resolve relative to the program directory, so launch it by")
-log("this path (or a full path to %s/startup.lua).", installTarget)
+installBasalt(sources)
+installClient(sources)

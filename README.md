@@ -77,6 +77,44 @@ Select [1]:
 wget run <上面的 install.lua URL> https://my.mirror/ccncm
 ```
 
+#### 两段式安装:共享 Basalt + 小型客户端
+
+安装器分两步,分别下载两个包:
+
+1. **共享 Basalt(第一阶段)** —— `Lib/basalt.lua` 是整个客户端里最大的单个
+   文件(约 322 KB,占原客户端约 80%),只安装**一次**到内置磁盘的绝对路径
+   `/Lib/basalt.lua`,供所有客户端安装共用。
+   - 若 `/Lib/basalt.lua` 已存在(且非空)就**直接跳过、不重复下载**,
+     只做存在性 + 非空的大小检查,不比对内容。
+   - 若内置磁盘放不下,安装器会打印**由该包实际测得的具体数字**
+     (剩余空间、所需字节、条目数)并终止;**不会**继续安装客户端。
+   - Basalt 永远只装在内置磁盘,绝不会装到可移动磁盘上。
+2. **客户端(第二阶段)** —— 去掉 Basalt 后的客户端只剩约 **84 KB**,
+   下载到内存、测量后,选择目标根目录(`/`,或磁盘驱动器 / 已挂载文件系统),
+   解压到 `<根>/ccncm/`。
+
+为什么客户端源码**一行都不用改**:`startup.lua` 里已有
+
+```lua
+package.path = "/?.lua;/?/init.lua;" .. package.path
+```
+
+CC 的 `require` 会把模块名里的 `.` 换成 `/` 再逐个代入 `package.path` 的
+`?`。因此 `require("Lib.basalt")` 会先命中**绝对**模板 `/?.lua` →
+`/Lib/basalt.lua`;默认的相对模板则继续负责 `Lib/utf8display.lua`、
+`ccncm.*`、`icons.*` 等同级文件。于是客户端可以任意放置(Basalt 走绝对路径,
+其余走相对路径),也就能缩小到放进 **125 KB 软盘**。
+
+两个包都是未压缩 USTAR(CC 端直接流式解压,不需要 gzip 或临时文件):
+
+| 包 | 内容 | 大小 |
+|---|---|---|
+| `dist/ccncm-lib.tar` | 唯一入口 `Lib/basalt.lua` | 331776 字节(约 324 KB) |
+| `dist/ccncm.tar` | 客户端 `ccncm/`(不含 `Lib/basalt.lua`) | 121344 字节(约 119 KB) |
+
+`dist/ccncm.tar` 不含 `README.md`、`install.lua`、`.luacheckrc`(源码/开发文件),
+但**保留 `LICENSE`**。每个包都有对应的 `dist/*.sha256`。
+
 #### 安装到磁盘驱动器 / 已挂载的文件系统
 
 电脑自身的磁盘只有约 1 MB,往往放不下客户端。安装器在**写入任何文件之前**
@@ -124,15 +162,35 @@ wget run <上面的 install.lua URL> https://my.mirror/ccncm /disk
 
 指定第二个参数后不再探测、也不再询问,但仍会用所选根目录做剩余空间检查。
 
+无论客户端装在哪里,**共享的 Basalt 都在内置磁盘的 `/Lib/basalt.lua`**。
+两个位置各自的运行命令:
+
+```
+内置磁盘:   ccncm/startup
+/disk 上:   disk/ccncm/startup
+```
+
+两个注意点:
+
+- **运行时不要移除驱动器里的磁盘**:客户端运行中仍需从 `/Lib/basalt.lua`
+  和它自己所在的可移动介质读取模块,拔出会导致 `require` / 文件读取失败。
+- **挂载必须是可写的**:`mount_mode` 必须是 `rw`;若为 `ro` 或 `ro_strict`,
+  解压会失败(安装器探测候选时也会跳过只读文件系统)。
+
 ### 手动安装
 
 1. 按 `netease-ncm-lua` 的说明在电脑上装好 `ncm`(会落到 `/ncm`)。
-2. 把**整个本项目目录**拷到电脑上。`Lib/`、`icons/`、`ccncm/` 必须与
-   `startup.lua` 同级——因为 `require("Lib.basalt")`、`require("icons.Home")`
-   是**相对于正在运行的程序的目录**解析的。
-   例如拷到 `/CCNCM/`,则应有 `/CCNCM/startup.lua`、`/CCNCM/Lib/basalt.lua`…
-3. 若要开机自启,把项目放在电脑根目录(使 `/startup.lua` 存在);放在子目录
-   时需手动运行(见下)。
+2. 把 Basalt 放到内置磁盘的 `/Lib/basalt.lua`(即手工做一遍第一阶段),
+   再把客户端目录(`startup.lua`、`ccncm/`、`Lib/utf8display.lua`、
+   `icons/`)拷到任意可写根目录的 `ccncm/` 下。
+   - `require("Lib.basalt")` 会先按**绝对**模板命中 `/Lib/basalt.lua`;
+     `require("Lib.utf8display")`、`require("icons.Home")` 等则**相对于正在
+     运行的程序目录**解析。所以客户端目录里必须带着 `Lib/utf8display.lua`
+     和 `icons/`,但不一定需要 `Lib/basalt.lua`。
+   - 如果你更想整包拷贝,也可以把 `Lib/basalt.lua` 和客户端放在一起
+     (例如 `/CCNCM/Lib/basalt.lua`),相对模板同样能找到它。
+3. 若要开机自启,把客户端放在电脑根目录(使 `/startup.lua` 存在);放在子目录
+   或磁盘上时需手动运行(见下)。
 
 > 拷贝方式随你:游戏内存盘、`pastebin`、HTTP 下载、直接放进存档的
 > `computercraft/computer/<id>/` 目录等均可。
@@ -166,10 +224,20 @@ ccncm/
   qr.lua             用 qr.encode 的矩阵生成 Basalt 位图(3x2 子像素打包)
   strings.lua        中文界面文案(以十进制字节转义保存,源码保持 ASCII)
 Lib/
-  basalt.lua         第三方 UI 框架
+  basalt.lua         第三方 UI 框架(安装后位于内置磁盘 /Lib/basalt.lua,共享)
   utf8display.lua    中文点阵渲染
   json.lua           第三方 JSON 库(rxi)
 icons/*.lua          图标位图
+```
+
+安装后的布局(客户端可以不在内置磁盘):
+
+```
+/Lib/basalt.lua          共享 Basalt(只装一次)
+<根>/ccncm/startup.lua   客户端入口(默认 <根> = /,也可为 /disk 等)
+<根>/ccncm/Lib/utf8display.lua
+<根>/ccncm/ccncm/*.lua
+<根>/ccncm/icons/*.lua
 ```
 
 ## 数据与文件
