@@ -32,7 +32,9 @@
 
   Usage
     wget run https://cdn.jsdelivr.net/gh/colorgarden/CC-CloudMusicNCM@main/install.lua
-    -- or, with a custom base URL for the bundle:
+    -- the installer then shows an interactive download-source menu
+    -- (jsDelivr / GitHub raw / ghproxy.net / custom URL);
+    -- pass a bundle base URL as the first argument to skip the menu:
     wget run <url> https://my.mirror/ccncm
 
   Everything is installed under `/` by default. Change CONFIG.root below to
@@ -253,18 +255,57 @@ if not fs.exists(NCM_INIT) then
 end
 
 -- --------------------------------------------------------------- source pick
--- Same mirror style as the reference installer. No interactive menu: the
--- first usable source wins, and a command-line argument overrides them all.
+-- Interactive mirror menu, same style as the library installer. All three
+-- mirrors serve the same repo; jsDelivr caches @main per file and has served
+-- stale files before, which is why the menu exists. `args[1]` (when non-empty)
+-- is a base URL and skips the menu, keeping the documented one-argument form
+-- working.
 local MIRRORS = {
   { name = "jsDelivr (recommended)", base = "https://cdn.jsdelivr.net/gh/colorgarden/CC-CloudMusicNCM@main" },
   { name = "GitHub raw", base = "https://raw.githubusercontent.com/colorgarden/CC-CloudMusicNCM/main" },
   { name = "ghproxy.net (GitHub proxy)", base = "https://ghproxy.net/https://raw.githubusercontent.com/colorgarden/CC-CloudMusicNCM/main" },
 }
 
-if args[1] and args[1] ~= "" then
-  CONFIG.base = args[1]:gsub("/+$", "")
-  print("Using command-line source: " .. CONFIG.base)
+local function trim(s)
+  return (s:gsub("^%s+", ""):gsub("%s+$", ""))
 end
+
+-- Reads one line; returns "" when the input stream is closed (non-interactive).
+local function ask(prompt)
+  if prompt then write(prompt) end
+  local ans = read and read() or nil
+  if ans == nil then return "" end
+  return trim(ans)
+end
+
+-- Interactive menu unless a base URL was given on the command line:
+--   install.lua [baseUrl]
+local function pickSource()
+  if args[1] and args[1] ~= "" then
+    CONFIG.base = args[1]:gsub("/+$", "")
+    print("Using command-line source: " .. CONFIG.base)
+    return
+  end
+
+  print("Choose a download source:")
+  for i, m in ipairs(MIRRORS) do print(("  %d) %s"):format(i, m.name)) end
+  print(("  %d) Custom URL"):format(#MIRRORS + 1))
+
+  local n = tonumber(ask("Select [1]: ")) or 1
+  if n >= 1 and n <= #MIRRORS then
+    CONFIG.base = MIRRORS[n].base
+    print("Selected: " .. MIRRORS[n].name)
+  elseif n == #MIRRORS + 1 then
+    local u = ask("Bundle base URL (the dir containing dist/ccncm.tar): ")
+    if u ~= "" then CONFIG.base = u:gsub("/+$", "") end
+    print("Using custom source")
+  else
+    CONFIG.base = MIRRORS[1].base
+    print("Invalid input, using default: " .. MIRRORS[1].name)
+  end
+end
+
+pickSource()
 
 -- --------------------------------------------------------------------- main
 local root = CONFIG.root
@@ -315,9 +356,12 @@ for i = 1, #sources do
     handle.close()
     log("  extracted %d files", files)
 
-    if fs.exists(target .. "/startup.lua") and fs.exists(target .. "/Lib/basalt.lua") then
+    if fs.exists(target .. "/startup.lua")
+      and fs.exists(target .. "/Lib/basalt.lua")
+      and fs.exists(target .. "/Lib/utf8display.lua")
+      and fs.exists(target .. "/icons/Home.lua") then
       installed = true
-      if i > 1 then log("  note: an earlier source did not serve a usable bundle") end
+      if i > 1 then log("  note: the chosen source failed; using another mirror") end
       break
     end
     log("  bundle incomplete; trying another mirror ...")

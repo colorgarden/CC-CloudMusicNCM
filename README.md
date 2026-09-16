@@ -41,6 +41,44 @@
 
 ## 安装
 
+### 一键安装(install.lua)
+
+本仓库自带 `install.lua`,可以直接在电脑上下载并解压到 `/ccncm`:
+
+```
+wget run https://cdn.jsdelivr.net/gh/colorgarden/CC-CloudMusicNCM@main/install.lua
+```
+
+运行后**先选择下载源**:
+
+```
+Choose a download source:
+  1) jsDelivr (recommended)
+  2) GitHub raw
+  3) ghproxy.net (GitHub proxy)
+  4) Custom URL
+Select [1]:
+```
+
+- 直接回车、或输入无法识别的值时,默认使用 **1(jsDelivr)**,不会报错;
+  输入 1..3 选择对应镜像。
+- 输入 **4** 会再要求输入一个基础 URL(即包含 `dist/ccncm.tar` 的目录)。
+- 安装器会**先**从选定的源下载;该源不可用或下载的包不完整时,自动依次回退到
+  其它已知镜像。每次尝试都会打印所用的基础 URL,发生回退时会多打印一行提示。
+  下载后会校验包里是否有 `ccncm/startup.lua`、`Lib/basalt.lua`、
+  `Lib/utf8display.lua`、`icons/Home.lua`,只有校验通过才算成功。
+- 若电脑上还没有 `ncm` 库(`/ncm/init.lua` 不存在),安装器会先用 `[y/N]`
+  询问是否通过 ghproxy 镜像下载并运行 `netease-ncm-lua` 的安装器,装好后继续。
+
+如果要固定下载源(例如脚本化/无人值守安装),把基础 URL 作为**第一个参数**
+传入即可**跳过菜单**:
+
+```
+wget run <上面的 install.lua URL> https://my.mirror/ccncm
+```
+
+### 手动安装
+
 1. 按 `netease-ncm-lua` 的说明在电脑上装好 `ncm`(会落到 `/ncm`)。
 2. 把**整个本项目目录**拷到电脑上。`Lib/`、`icons/`、`ccncm/` 必须与
    `startup.lua` 同级——因为 `require("Lib.basalt")`、`require("icons.Home")`
