@@ -113,9 +113,26 @@ local player = {
   format = nil,
 }
 -- Set while waiting for a previous speaker to acknowledge speakerlib_stop before
--- the next song is launched with the same id.
+-- the next song is launched with the same id.  Holding the queued song here (and
+-- never launching it anywhere else) is what stops a burst of stop/end events
+-- from spawning more than one instance.
 local pendingLaunch = nil
 local launchSeq = 0
+-- Launch sequence of the instance we believe is running.  Every launch takes a
+-- new value.  speakerlib events carry this client's *shared* id, not a per-run
+-- one, so the sequence is how we tell a current acknowledgement apart from a
+-- late one belonging to an instance we already gave up on.
+local activeSeq = 0
+-- Sequence of the instance we have asked to stop.  Cleared once its
+-- speakerlib_play_stop/_play_end arrives; if that never happens the 4 s safety
+-- timer moves on and a mismatched value marks the later event as stale.
+local stopRequestSeq = nil
+-- True from scheduleSpeaker() until the instance emits a terminal event.  This
+-- is what makes a song change stop the previous one even while it is still
+-- downloading (when neither playing nor ready is set yet).
+local speakerAlive = false
+-- Bounded wait for the old instance to acknowledge speakerlib_stop.
+local STOP_ACK_TIMEOUT = 4
 
 local GLYPH_H = 3
 
@@ -220,14 +237,19 @@ local function playerLabelText()
   return text
 end
 
+-- The play/pause button icon, derived from the one mirrored state: a live,
+-- unpaused song offers "pause", anything else (paused or stopped) offers "play".
+local function playerIconName()
+  return (player.playing and not player.paused) and "icons.PauseCircle" or "icons.PlayCircle"
+end
+
 -- Push the mirrored state into the player bar.
 local function refreshPlayerUI()
   if playerTitle then
     playerTitle:setImage(bmp(playerLabelText()))
   end
   if playPauseButton then
-    local icon = (player.playing and not player.paused) and "icons.PauseCircle" or "icons.PlayCircle"
-    local ok, ib = pcall(require, icon)
+    local ok, ib = pcall(require, playerIconName())
     if ok and type(ib) == "table" then playPauseButton:setImage(ib) end
   end
 end
@@ -245,10 +267,12 @@ local function scheduleSpeaker(url, song)
   player.paused = false
   player.stopped = false
   player.format = nil
+  speakerAlive = true
   refreshPlayerUI()
 
   local can, why = data.canPlay()
   if not can then
+    speakerAlive = false
     player.stopped = true
     notify(why or S.no_speaker)
     refreshPlayerUI()
@@ -257,7 +281,9 @@ local function scheduleSpeaker(url, song)
 
   launchSeq = launchSeq + 1
   local mySeq = launchSeq
+  activeSeq = mySeq
   if type(basalt.schedule) ~= "function" then
+    speakerAlive = false
     player.stopped = true
     notify(S.play_failed .. ": background scheduler unavailable")
     refreshPlayerUI()
@@ -271,25 +297,57 @@ local function scheduleSpeaker(url, song)
     forceFullRedraw()
     if not ok and mySeq == launchSeq then
       pcall(notify, S.play_failed .. ": " .. tostring(err), 4)
+      speakerAlive = false
       player.stopped = true
       player.playing = false
+      player.ready = false
+      player.paused = false
       pcall(refreshPlayerUI)
     end
   end)
 end
 
+-- True while a song is loaded and has not ended/stopped.  A pause/resume is only
+-- meaningful in this window, so all three pause sources below funnel through
+-- setPaused(), which no-ops outside it.
+local function playbackLive()
+  return player.title ~= nil and not player.stopped
+end
+
+-- Flip the single paused bit the UI reads.  Called from our own control events
+-- (speakerlib_pause/_resume), from the program's acknowledgements
+-- (speakerlib_play_pause/_play_resume) and from speakerlib_state's JSON, so all
+-- three sources of truth land in the same place.
+local function setPaused(paused)
+  if not playbackLive() then return end
+  player.paused = paused and true or false
+  if not paused then player.playing = true end
+  refreshPlayerUI()
+end
+
 -- Apply a parsed speakerlib_state payload (progress/total/volume/paused/mode/
--- format) to the mirrored state.
+-- format) to the mirrored state.  speakerlib_state is the periodic full snapshot
+-- (stateEvent() in speaker.lua), so it is authoritative for `paused` too.
 local function applySpeakerState(st)
   if type(st) ~= "table" then return end
   if st.total ~= nil then player.total = tonumber(st.total) or player.total end
   if st.progress ~= nil then player.progress = tonumber(st.progress) or player.progress end
   if st.volume ~= nil then player.volume = tonumber(st.volume) or player.volume end
-  if st.paused ~= nil then player.paused = st.paused and true or false end
-  if st.playing ~= nil then player.playing = st.playing and true or false end
   if st.format ~= nil then player.format = st.format end
-  if st.stopped then player.stopped = true; player.playing = false end
-  if st.finished then player.stopped = true; player.playing = false end
+  -- A stopped/finished snapshot wins outright: paused must not survive it.
+  if st.stopped or st.finished then
+    player.stopped = true
+    player.playing = false
+    player.ready = false
+    player.paused = false
+  else
+    if st.paused ~= nil and playbackLive() then
+      player.paused = st.paused and true or false
+    end
+    if st.playing ~= nil and playbackLive() then
+      player.playing = st.playing and true or false
+    end
+  end
   refreshPlayerUI()
 end
 
@@ -303,41 +361,87 @@ local function onSpeakerEvent(name, fn)
   end)
 end
 
+-- Drop the safety timer of a queued song change, if it has one.
+local function cancelPendingTimer(pend)
+  pend = pend or pendingLaunch
+  if pend and pend.timerId then pcall(os.cancelTimer, pend.timerId) end
+end
+
+-- A launched instance emitted a terminal event.  If a song change is queued,
+-- this event is its acknowledgement: consume the queue and start the song right
+-- now.  scheduleSpeaker() is reached from nowhere else for a queued song, so a
+-- burst of stop/end events can never launch two instances.
+local function instanceStopped()
+  speakerAlive = false
+  stopRequestSeq = nil
+  local pend = pendingLaunch
+  if pend then
+    pendingLaunch = nil
+    cancelPendingTimer(pend)
+    scheduleSpeaker(pend.url, pend.song)
+  end
+end
+
+-- Shared handling for speakerlib_play_stop and speakerlib_play_end.  speaker.lua
+-- sends exactly one of them per instance (controlLoop's stop branch sends
+-- play_stop + stateEvent({stopped=true}); program end sends play_end unless the
+-- stop branch already ran), so this is the single place an instance is retired.
+local function onTerminalEvent()
+  if pendingLaunch then
+    -- The instance we asked to stop has acknowledged; release the queued song.
+    instanceStopped()
+    return
+  end
+  if stopRequestSeq ~= nil and stopRequestSeq ~= activeSeq then
+    -- Late acknowledgement from an instance the safety timer already gave up on.
+    -- A newer instance is alive, so do not overwrite its state.
+    stopRequestSeq = nil
+    return
+  end
+  stopRequestSeq = nil
+  speakerAlive = false
+  -- Clear the track like playerStop does, so the player bar shows the existing
+  -- not-playing label instead of a title with a stale progress readout.
+  player.title = nil
+  player.playing = false
+  player.ready = false
+  player.stopped = true
+  player.paused = false
+  refreshPlayerUI()
+end
+
 local function registerSpeakerEvents()
   onSpeakerEvent("speakerlib_downloading", function()
     player.ready = false; player.playing = false; player.stopped = false
+    player.paused = false
     refreshPlayerUI()
   end)
   onSpeakerEvent("speakerlib_ready", function(format, total)
     player.ready = true
+    player.stopped = false
     player.format = format
     player.total = tonumber(total) or player.total
     refreshPlayerUI()
   end)
   onSpeakerEvent("speakerlib_play_start", function()
     player.playing = true; player.paused = false; player.stopped = false
+    -- By the time a fresh instance starts, any outstanding request belonged to
+    -- an older instance we already moved past; stop treating it as pending.
+    if stopRequestSeq ~= nil and stopRequestSeq ~= activeSeq then stopRequestSeq = nil end
     refreshPlayerUI()
   end)
-  onSpeakerEvent("speakerlib_play_pause", function()
-    player.paused = true; refreshPlayerUI()
-  end)
-  onSpeakerEvent("speakerlib_play_resume", function()
-    player.paused = false; player.playing = true; refreshPlayerUI()
-  end)
-  onSpeakerEvent("speakerlib_play_end", function()
-    player.playing = false; player.stopped = true; refreshPlayerUI()
-  end)
-  onSpeakerEvent("speakerlib_play_stop", function()
-    player.playing = false; player.stopped = true
-    refreshPlayerUI()
-    local pend = pendingLaunch
-    pendingLaunch = nil
-    if pend then
-      if pend.timerId then pcall(os.cancelTimer, pend.timerId) end
-      scheduleSpeaker(pend.url, pend.song)
-    end
-  end)
+  onSpeakerEvent("speakerlib_play_pause", function() setPaused(true) end)
+  onSpeakerEvent("speakerlib_play_resume", function() setPaused(false) end)
+  -- Our own control events are a source of truth too: the play/pause button must
+  -- flip as soon as we queue speakerlib_pause/_resume, not only on the
+  -- acknowledgement.
+  onSpeakerEvent("speakerlib_pause", function() setPaused(true) end)
+  onSpeakerEvent("speakerlib_resume", function() setPaused(false) end)
+  onSpeakerEvent("speakerlib_play_end", onTerminalEvent)
+  onSpeakerEvent("speakerlib_play_stop", onTerminalEvent)
   -- speakerlib_state is JSON, so parse it instead of using the (id, a, b) shape.
+  -- A malformed payload must not break the dispatcher: unserializeJSON and
+  -- applySpeakerState are both pcall-wrapped.
   basalt.onEvent("speakerlib_state", function(id, json)
     if id ~= nil and id ~= data.SPEAKER_ID then return end
     local ok, st = pcall(textutils.unserializeJSON, json)
@@ -346,17 +450,25 @@ local function registerSpeakerEvents()
 end
 
 -- Player controls.  Each queues the matching speakerlib control event with the
--- client's id; the player UI updates only when speakerlib acknowledges.
+-- client's id; the state flips on our own event and is confirmed by the
+-- program's speakerlib_play_* acknowledgement.
 function M.playerToggle()
-  if not player.title then return end
+  -- Pausing/resuming with nothing loaded is a no-op, not a state change.
+  if not playbackLive() then return end
   if player.paused then data.resumeSpeaker() else data.pauseSpeaker() end
 end
 
 function M.playerStop()
-  data.stopSpeaker()
+  local pend = pendingLaunch
   pendingLaunch = nil
+  cancelPendingTimer(pend)
+  data.stopSpeaker()
+  -- Keep the instance marked alive until its acknowledgement so a song chosen
+  -- right after Stop waits for it instead of overlapping it.
+  if speakerAlive then stopRequestSeq = activeSeq end
   player.stopped = true
   player.playing = false
+  player.ready = false
   player.paused = false
   player.title = nil
   refreshPlayerUI()
@@ -392,6 +504,11 @@ end
 -- The exact text currently shown in the player bar (same source as the label).
 function M.playerLabel()
   return playerLabelText()
+end
+
+-- The icon the play/pause button currently shows (same source as refreshPlayerUI).
+function M.playerIcon()
+  return playerIconName()
 end
 
 -- Verification/debug accessor for the mirrored state (read-only copy).
@@ -550,19 +667,27 @@ function M.playSong(song)
 
   addRecent(song)
 
-  -- A speaker is already active: stop it first and remember this song for the
-  -- speakerlib_play_stop handler.  The id is shared, so the stale stop event
-  -- must be consumed before the next instance starts.
-  if player.playing or player.ready or pendingLaunch then
+  -- A speaker instance is already alive (playing, ready, still downloading, or a
+  -- previous change is queued): stop it first.  Only its own
+  -- speakerlib_play_stop/_play_end may launch the queued song (see
+  -- onTerminalEvent), so A->B->C ends with C alone.  The old instance is waited
+  -- for so the previous audio really stops before the new one starts; if it
+  -- never acknowledges, the bounded timer proceeds and logs on the terminal.
+  if speakerAlive or pendingLaunch or player.playing or player.ready then
+    cancelPendingTimer()
     local token = {}
     pendingLaunch = { url = url, song = song, token = token }
+    stopRequestSeq = activeSeq
     data.stopSpeaker()
-    pendingLaunch.timerId = after(3, function()
+    pendingLaunch.timerId = after(STOP_ACK_TIMEOUT, function()
       local pend = pendingLaunch
-      if pend and pend.token == token then
-        pendingLaunch = nil
-        scheduleSpeaker(url, song)
-      end
+      if not pend or pend.token ~= token then return end
+      pendingLaunch = nil
+      -- ASCII only: this is the computer's terminal log, not the monitor UI.
+      pcall(data.printNative,
+        "speaker: previous instance did not acknowledge stop within " ..
+        STOP_ACK_TIMEOUT .. "s; starting the next song anyway")
+      scheduleSpeaker(url, song)
     end)
     return
   end
