@@ -17,6 +17,11 @@ M.reason = nil
 -- directory at runtime; fall back to the documented install path.
 local SPEAKER_PROGRAM = "/ncm/lib/speaker.lua"
 
+-- The id carried by every speakerlib event.  The same id is passed to the
+-- program with -id and to all control events, so speakerlib knows the events
+-- belong to this client.
+M.SPEAKER_ID = "ccncm"
+
 -- ============================================================================
 -- Initialisation
 -- ============================================================================
@@ -167,16 +172,65 @@ function M.qrCheck(key)
   return body.code, cookie
 end
 
+-- Pull account/profile out of either the login_status wrapper (body.data) or a
+-- raw user_account body.  Both endpoints answer with the same top-level fields.
+local function accountParts(body)
+  if type(body) ~= "table" then return nil, nil end
+  local d = body.data
+  if type(d) == "table" and (d.account ~= nil or d.profile ~= nil) then
+    return d.account, d.profile
+  end
+  return body.account, body.profile
+end
+
 function M.account()
   if not ncm then return nil, "ncm unavailable" end
+  if type(M.cookie) ~= "string" or M.cookie == "" then return nil, "no cookie" end
   local ok, res = pcall(ncm.user_account, { cookie = M.cookie })
   if not ok then return nil, M.errText(res) end
-  local profile = res.body and res.body.profile
+  local account, profile = accountParts(res.body)
   if profile then
-    M.uid = profile.userId
+    M.uid = profile.userId or (account and account.id)
     return profile
   end
   return nil, "no profile in the response"
+end
+
+-- True login state.  ncm.login_status calls /api/w/nuser/account/get and, when
+-- the response code is 200, wraps the raw body under body.data, so the real
+-- fields are body.data.account / body.data.profile.  Returns a table
+-- { loggedIn, account, profile, uid, vip, code }, or (nil, err) when the check
+-- itself could not run (no library / network failure) so the caller can tell a
+-- network error apart from a genuine "logged out".
+function M.loginStatus()
+  if not ncm then return nil, "ncm unavailable" end
+  if type(M.cookie) ~= "string" or M.cookie == "" then
+    return { loggedIn = false, reason = "no_cookie" }
+  end
+  local ok, res = pcall(ncm.login_status, { cookie = M.cookie })
+  if not ok then return nil, M.errText(res) end
+  local body = res.body or {}
+  local account, profile = accountParts(body)
+  local uid = (account and (account.id or account.userId)) or (profile and profile.userId)
+  local loggedIn = (account ~= nil and uid ~= nil) or (profile ~= nil and profile.userId ~= nil)
+  if loggedIn then M.uid = uid end
+  return {
+    loggedIn = loggedIn,
+    account = account,
+    profile = profile,
+    uid = uid,
+    vip = account and (account.vipType or account.vipRights) or (profile and profile.vipType),
+    code = body.code or (body.data and body.data.code),
+    reason = loggedIn and nil or "not_logged_in",
+  }
+end
+
+-- Log out on the server when possible, then always drop the local cookie.
+function M.logout()
+  if ncm and type(M.cookie) == "string" and M.cookie ~= "" then
+    pcall(ncm.logout, { cookie = M.cookie })
+  end
+  M.clearCookie()
 end
 
 -- ============================================================================
@@ -312,19 +366,60 @@ function M.songUrl(id, level)
   return d.url, d.type, nil
 end
 
--- Hand the link to the speaker program.  It blocks the UI until playback
--- finishes, which is the trade-off documented in the README.
-function M.launchSpeaker(url)
+-- Can playback start at all?  Separated from runSpeaker so the UI can report a
+-- missing program / speaker before it schedules the background run.
+function M.canPlay()
   if not fs.exists(SPEAKER_PROGRAM) then
     return false, "speaker program missing: " .. SPEAKER_PROGRAM
   end
   if not M.hasSpeaker() then
     return false, "no speaker attached"
   end
-  local ok, res = pcall(shell.run, SPEAKER_PROGRAM, url, "-id", "ccncm")
-  if not ok then return false, tostring(res) end
-  if res == false then return false, "speaker program not runnable" end
   return true
+end
+
+-- Run the speaker program for `url`.  This blocks the *calling coroutine* until
+-- playback ends, so the UI must call it through basalt.schedule(), which pumps
+-- the coroutine with the Basalt event loop and keeps the UI responsive.
+--   -noui  speakerlib never paints its own page over the client.
+--   -id    every speakerlib_* event carries this client's id.
+function M.runSpeaker(url)
+  if not fs.exists(SPEAKER_PROGRAM) then
+    return false, "speaker program missing: " .. SPEAKER_PROGRAM
+  end
+  if not M.hasSpeaker() then
+    return false, "no speaker attached"
+  end
+  local ok, res = pcall(shell.run, SPEAKER_PROGRAM, url, "-id", M.SPEAKER_ID, "-noui")
+  if not ok then return false, tostring(res) end
+  if res == false then return false, "speaker program exited with an error" end
+  return true
+end
+
+-- Control events.  speakerlib expects (event, id, ...) and ignores events whose
+-- id is not its own, so every one of these carries M.SPEAKER_ID.
+function M.pauseSpeaker()
+  os.queueEvent("speakerlib_pause", M.SPEAKER_ID)
+end
+
+function M.resumeSpeaker()
+  os.queueEvent("speakerlib_resume", M.SPEAKER_ID)
+end
+
+function M.stopSpeaker()
+  os.queueEvent("speakerlib_stop", M.SPEAKER_ID)
+end
+
+function M.seekSpeaker(seconds)
+  seconds = tonumber(seconds) or 0
+  if seconds < 0 then seconds = 0 end
+  os.queueEvent("speakerlib_seek", M.SPEAKER_ID, seconds)
+end
+
+function M.setSpeakerVolume(level)
+  level = tonumber(level) or 0
+  if level < 0 then level = 0 elseif level > 3 then level = 3 end
+  os.queueEvent("speakerlib_volume", M.SPEAKER_ID, level)
 end
 
 return M

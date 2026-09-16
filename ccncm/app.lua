@@ -83,7 +83,7 @@ local root
 local navFrame, navList
 local topFrame, pageTitle, backButton, userButton, searchInput
 local contentFrame, contentList
-local playerFrame, playerTitle
+local playerFrame, playerTitle, playPauseButton
 local popupFrame, popupLabel
 local loginFrame, loginQrLabel, loginStatus, loginRefresh, loginCancel
 
@@ -96,6 +96,29 @@ local currentTitle = ""
 
 local loginKey = nil
 local loginPolling = false
+
+-- Playback state mirrored from speakerlib's events.  The UI reads and writes
+-- only this table; the speaker program itself runs in the background.
+local player = {
+  title = nil,
+  total = 0,
+  progress = 0,
+  volume = 1,
+  paused = false,
+  playing = false,
+  ready = false,
+  stopped = true,
+  format = nil,
+}
+-- Set while waiting for a previous speaker to acknowledge speakerlib_stop before
+-- the next song is launched with the same id.
+local pendingLaunch = nil
+local launchSeq = 0
+
+-- Login state, confirmed against the server with ncm.login_status.
+local loggedIn = false
+local loginStateKnown = false
+local userProfile = nil
 
 local GLYPH_H = 3
 
@@ -149,6 +172,219 @@ local function onTimer(id)
   if not ok then
     pcall(notify, "timer: " .. tostring(err), 4)
   end
+end
+
+-- ============================================================================
+-- Playback state (mirrored from speakerlib events)
+-- ============================================================================
+
+local function fmtClock(seconds)
+  local total = math.floor(tonumber(seconds) or 0)
+  if total < 0 then total = 0 end
+  return string.format("%02d:%02d", math.floor(total / 60), total % 60)
+end
+
+local function playerLabelText()
+  if not player.title then return S.not_playing end
+  local text = S.now_playing_prefix .. player.title
+  if player.total and player.total > 0 then
+    text = text .. "  " .. fmtClock(player.progress) .. "/" .. fmtClock(player.total)
+  end
+  if player.paused then
+    text = text .. "  [" .. S.paused_flag .. "]"
+  elseif not player.playing and not player.stopped then
+    text = text .. "  " .. S.buffering
+  end
+  return text
+end
+
+-- Push the mirrored state into the player bar.
+local function refreshPlayerUI()
+  if playerTitle then
+    playerTitle:setImage(bmp(playerLabelText()))
+  end
+  if playPauseButton then
+    local icon = (player.playing and not player.paused) and "icons.PauseCircle" or "icons.PlayCircle"
+    local ok, ib = pcall(require, icon)
+    if ok and type(ib) == "table" then playPauseButton:setImage(ib) end
+  end
+end
+
+-- Run the speaker program for `url` in a Basalt-scheduled coroutine.  shell.run
+-- blocks that coroutine, not the UI: Basalt resumes it as events arrive, so the
+-- Basalt event loop keeps running and already-queued speakerlib events reach the
+-- client's own handlers.
+local function scheduleSpeaker(url, song)
+  player.title = (song and song.name) or player.title
+  player.total = 0
+  player.progress = 0
+  player.ready = false
+  player.playing = false
+  player.paused = false
+  player.stopped = false
+  player.format = nil
+  refreshPlayerUI()
+
+  local can, why = data.canPlay()
+  if not can then
+    player.stopped = true
+    notify(why or S.no_speaker)
+    refreshPlayerUI()
+    return
+  end
+
+  launchSeq = launchSeq + 1
+  local mySeq = launchSeq
+  if type(basalt.schedule) ~= "function" then
+    player.stopped = true
+    notify(S.play_failed .. ": background scheduler unavailable")
+    refreshPlayerUI()
+    return
+  end
+  basalt.schedule(function()
+    local ok, err = data.runSpeaker(url)
+    -- -noui means the speaker never paints, but if it ever did (or another
+    -- program shared the terminal) repaint the whole frame rather than leaving
+    -- stale cells behind.
+    forceFullRedraw()
+    if not ok and mySeq == launchSeq then
+      pcall(notify, S.play_failed .. ": " .. tostring(err), 4)
+      player.stopped = true
+      player.playing = false
+      pcall(refreshPlayerUI)
+    end
+  end)
+end
+
+-- Apply a parsed speakerlib_state payload (progress/total/volume/paused/mode/
+-- format) to the mirrored state.
+local function applySpeakerState(st)
+  if type(st) ~= "table" then return end
+  if st.total ~= nil then player.total = tonumber(st.total) or player.total end
+  if st.progress ~= nil then player.progress = tonumber(st.progress) or player.progress end
+  if st.volume ~= nil then player.volume = tonumber(st.volume) or player.volume end
+  if st.paused ~= nil then player.paused = st.paused and true or false end
+  if st.playing ~= nil then player.playing = st.playing and true or false end
+  if st.format ~= nil then player.format = st.format end
+  if st.stopped then player.stopped = true; player.playing = false end
+  if st.finished then player.stopped = true; player.playing = false end
+  refreshPlayerUI()
+end
+
+-- Register one speakerlib event handler.  A nil id is tolerated (some emitters
+-- omit it) but an id for another player is ignored.
+local function onSpeakerEvent(name, fn)
+  basalt.onEvent(name, function(id, a, b)
+    if id ~= nil and id ~= data.SPEAKER_ID then return end
+    local ok, err = pcall(fn, a, b)
+    if not ok then pcall(notify, name .. ": " .. tostring(err), 3) end
+  end)
+end
+
+local function registerSpeakerEvents()
+  onSpeakerEvent("speakerlib_downloading", function()
+    player.ready = false; player.playing = false; player.stopped = false
+    refreshPlayerUI()
+  end)
+  onSpeakerEvent("speakerlib_ready", function(format, total)
+    player.ready = true
+    player.format = format
+    player.total = tonumber(total) or player.total
+    refreshPlayerUI()
+  end)
+  onSpeakerEvent("speakerlib_play_start", function()
+    player.playing = true; player.paused = false; player.stopped = false
+    refreshPlayerUI()
+  end)
+  onSpeakerEvent("speakerlib_play_pause", function()
+    player.paused = true; refreshPlayerUI()
+  end)
+  onSpeakerEvent("speakerlib_play_resume", function()
+    player.paused = false; player.playing = true; refreshPlayerUI()
+  end)
+  onSpeakerEvent("speakerlib_play_end", function()
+    player.playing = false; player.stopped = true; refreshPlayerUI()
+  end)
+  onSpeakerEvent("speakerlib_play_stop", function()
+    player.playing = false; player.stopped = true
+    refreshPlayerUI()
+    local pend = pendingLaunch
+    pendingLaunch = nil
+    if pend then
+      if pend.timerId then pcall(os.cancelTimer, pend.timerId) end
+      scheduleSpeaker(pend.url, pend.song)
+    end
+  end)
+  -- speakerlib_state is JSON, so parse it instead of using the (id, a, b) shape.
+  basalt.onEvent("speakerlib_state", function(id, json)
+    if id ~= nil and id ~= data.SPEAKER_ID then return end
+    local ok, st = pcall(textutils.unserializeJSON, json)
+    if ok and type(st) == "table" then pcall(applySpeakerState, st) end
+  end)
+end
+
+-- Player controls.  Each queues the matching speakerlib control event with the
+-- client's id; the player UI updates only when speakerlib acknowledges.
+function M.playerToggle()
+  if not player.title then return end
+  if player.paused then data.resumeSpeaker() else data.pauseSpeaker() end
+end
+
+function M.playerStop()
+  data.stopSpeaker()
+  pendingLaunch = nil
+  player.stopped = true
+  player.playing = false
+  player.paused = false
+  player.title = nil
+  refreshPlayerUI()
+end
+
+function M.playerSeek(delta)
+  if not player.title then return end
+  local target = (tonumber(player.progress) or 0) + (tonumber(delta) or 0)
+  if target < 0 then target = 0 end
+  if player.total and player.total > 0 and target > player.total then target = player.total end
+  player.progress = target
+  data.seekSpeaker(target)
+  refreshPlayerUI()
+end
+
+function M.playerVolumeCycle()
+  local levels = { 0, 1, 2, 3 }
+  local current = tonumber(player.volume) or 1
+  local nextLevel = 0
+  for i = 1, #levels do
+    if levels[i] > current then
+      nextLevel = levels[i]
+      break
+    end
+    if i == #levels then nextLevel = 0 end
+  end
+  player.volume = nextLevel
+  data.setSpeakerVolume(nextLevel)
+  notify(S.volume .. ": " .. tostring(nextLevel), 1.2)
+  refreshPlayerUI()
+end
+
+-- The exact text currently shown in the player bar (same source as the label).
+function M.playerLabel()
+  return playerLabelText()
+end
+
+-- Verification/debug accessor for the mirrored state (read-only copy).
+function M.playerState()
+  return {
+    title = player.title,
+    total = player.total,
+    progress = player.progress,
+    volume = player.volume,
+    paused = player.paused,
+    playing = player.playing,
+    ready = player.ready,
+    stopped = player.stopped,
+    format = player.format,
+  }
 end
 
 -- ============================================================================
@@ -273,7 +509,6 @@ end
 
 function M.playSong(song)
   if type(song) ~= "table" then return end
-  playerTitle:setImage(bmp(S.now_playing_prefix .. song.name))
   if not data.available then
     notify(S.network_error)
     return
@@ -285,19 +520,32 @@ function M.playSong(song)
   end
   if not url then
     notify(S.play_failed .. ": " .. tostring(err))
-    playerTitle:setImage(bmp(S.not_playing))
+    player.title = nil
+    player.stopped = true
+    refreshPlayerUI()
     return
   end
 
   addRecent(song)
-  local ok, lerr = data.launchSpeaker(url)
-  forceFullRedraw()
-  if not ok then
-    notify(tostring(lerr))
-    playerTitle:setImage(bmp(S.not_playing))
-  else
-    playerTitle:setImage(bmp(S.stopped))
+
+  -- A speaker is already active: stop it first and remember this song for the
+  -- speakerlib_play_stop handler.  The id is shared, so the stale stop event
+  -- must be consumed before the next instance starts.
+  if player.playing or player.ready or pendingLaunch then
+    local token = {}
+    pendingLaunch = { url = url, song = song, token = token }
+    data.stopSpeaker()
+    pendingLaunch.timerId = after(3, function()
+      local pend = pendingLaunch
+      if pend and pend.token == token then
+        pendingLaunch = nil
+        scheduleSpeaker(url, song)
+      end
+    end)
+    return
   end
+
+  scheduleSpeaker(url, song)
 end
 
 local function playQueueOffset(delta)
@@ -317,7 +565,7 @@ end
 -- ============================================================================
 
 local function requireLogin()
-  if data.cookie then return false end
+  if loggedIn then return false end
   notify(S.need_login)
   return true
 end
@@ -402,16 +650,57 @@ local function switchPage(key)
 end
 
 -- ============================================================================
--- Login (QR)
+-- Login (QR) and verified login state
 -- ============================================================================
 
-local function refreshUserLabel()
+local function updateUserLabel()
   local label = S.login
-  if data.cookie then
-    local profile = data.account()
-    if profile and profile.nickname then label = profile.nickname end
+  if loggedIn then
+    if userProfile and userProfile.nickname then
+      label = userProfile.nickname
+    else
+      label = S.user
+    end
+  elseif data.cookie then
+    -- A cookie exists but has not been confirmed yet.
+    label = S.user
   end
   userButton:setImage(bmp(label))
+end
+
+-- Confirm the stored cookie with ncm.login_status.
+--   no cookie                   -> logged out
+--   cookie, server says invalid -> clear /ncm_cookie, show logged out
+--   cookie, server says valid   -> logged in, refresh the user area
+--   check could not run         -> keep the cookie, surface the error
+local function refreshLoginState(opts)
+  opts = opts or {}
+  if not data.cookie then
+    loggedIn = false
+    loginStateKnown = true
+    userProfile = nil
+    updateUserLabel()
+    return false
+  end
+  local st, err = data.loginStatus()
+  if not st then
+    if opts.notify then
+      notify(S.network_error .. ": " .. tostring(err), 4)
+    end
+    return nil
+  end
+  loginStateKnown = true
+  if st.loggedIn then
+    loggedIn = true
+    userProfile = st.profile
+    data.uid = st.uid
+  else
+    loggedIn = false
+    userProfile = nil
+    data.clearCookie()
+  end
+  updateUserLabel()
+  return st.loggedIn
 end
 
 local function stopLoginPoll()
@@ -430,7 +719,13 @@ local function pollLogin()
     stopLoginPoll()
     if data.saveCookie(cookie) then
       setLoginStatus(S.scan_success)
-      refreshUserLabel()
+      -- Do not trust the scan alone: re-check the account with login_status.
+      local verified = refreshLoginState()
+      if not verified then
+        -- The server can lag a moment behind the confirmation; retry briefly.
+        after(1, function() refreshLoginState() end)
+        after(2.5, function() refreshLoginState() end)
+      end
       after(1.2, function() showFrame(loginFrame, false) end)
     else
       setLoginStatus(S.scan_failed)
@@ -504,9 +799,27 @@ local function openLogin()
 end
 
 local function openLogout()
-  data.clearCookie()
-  refreshUserLabel()
+  data.logout()
+  loggedIn = false
+  loginStateKnown = true
+  userProfile = nil
+  updateUserLabel()
   notify(S.logout)
+end
+
+-- Read-only accessors for the pages and the verification harness.
+function M.loginState()
+  return {
+    loggedIn = loggedIn,
+    known = loginStateKnown,
+    nickname = userProfile and userProfile.nickname,
+    uid = data.uid,
+    hasCookie = data.cookie ~= nil,
+  }
+end
+
+function M.refreshLoginState(opts)
+  return refreshLoginState(opts)
 end
 
 -- ============================================================================
@@ -522,7 +835,8 @@ local function buildLayout()
 
   local NAV_W = 16
   local TOP_H = 4
-  local PLAYER_H = GLYPH_H + 1
+  -- Two text rows: the now-playing line and the control row underneath it.
+  local PLAYER_H = GLYPH_H * 2
   local contentX = NAV_W + 1
   local contentW = W - NAV_W
   local midH = H - PLAYER_H
@@ -598,8 +912,12 @@ local function buildLayout()
   })
   userButton:setImage(bmp(S.login))
   userButton:onClick(function()
-    if data.cookie then
+    if loggedIn then
       openLogout()
+    elseif data.cookie then
+      -- Cookie present but not confirmed: retry the check instead of logging in
+      -- again (a network error must not silently look like "logged out").
+      refreshLoginState({ notify = true })
     else
       openLogin()
     end
@@ -636,26 +954,46 @@ local function buildLayout()
     background = colors.gray,
   })
   playerTitle = playerFrame:addLabel({
-    x = 2, y = 1, width = W - 20, height = GLYPH_H,
+    x = 2, y = 1, width = W - 2, height = GLYPH_H,
     autoSize = false, backgroundEnabled = true,
     foreground = colors.white, background = colors.gray,
   })
   playerTitle:setImage(bmp(S.not_playing))
 
-  local ctrlY = 1
-  local function ctrlButton(x, icon, fn)
+  -- One control row under the title.  The controls only queue speakerlib
+  -- events; speakerlib acknowledges each with speakerlib_play_* / _state, which
+  -- is what actually moves the UI.
+  local ctrlY = GLYPH_H + 1
+  local function addCtrl(x, label, icon, fn)
     local b = playerFrame:addButton({
       x = x, y = ctrlY, width = 4, height = GLYPH_H,
       foreground = colors.purple, background = colors.gray,
     })
-    local ok, ib = pcall(require, icon)
-    if ok and type(ib) == "table" then b:setImage(ib) end
+    if icon then
+      local ok, ib = pcall(require, icon)
+      if ok and type(ib) == "table" then
+        b:setImage(ib)
+      else
+        b:setImage(bmp(label or ""))
+      end
+    else
+      b:setImage(bmp(label or ""))
+    end
     if fn then b:onClick(fn) end
+    return b
   end
-  local ctrlX = math.max(2, W - 15)
-  ctrlButton(ctrlX, "icons.PreviousSong", function() playQueueOffset(-1) end)
-  ctrlButton(ctrlX + 5, "icons.PlayCircle", function() playQueueOffset(0) end)
-  ctrlButton(ctrlX + 10, "icons.NextSong", function() playQueueOffset(1) end)
+  local nCtrl, ctrlW, ctrlGap = 7, 4, 1
+  local ctrlTotal = nCtrl * ctrlW + (nCtrl - 1) * ctrlGap
+  local ctrlX = math.max(2, math.floor((W - ctrlTotal) / 2) + 1)
+  local function ctrlPos(i) return ctrlX + (i - 1) * (ctrlW + ctrlGap) end
+
+  addCtrl(ctrlPos(1), "-10", nil, function() M.playerSeek(-10) end)
+  addCtrl(ctrlPos(2), nil, "icons.PreviousSong", function() playQueueOffset(-1) end)
+  playPauseButton = addCtrl(ctrlPos(3), nil, "icons.PlayCircle", function() M.playerToggle() end)
+  addCtrl(ctrlPos(4), nil, "icons.NextSong", function() playQueueOffset(1) end)
+  addCtrl(ctrlPos(5), "+10", nil, function() M.playerSeek(10) end)
+  addCtrl(ctrlPos(6), "VOL", nil, function() M.playerVolumeCycle() end)
+  addCtrl(ctrlPos(7), "STOP", nil, function() M.playerStop() end)
 
   -- Popup -----------------------------------------------------------------
   popupFrame = root:addFrame({
@@ -715,14 +1053,17 @@ function M.build()
   end
 
   buildLayout()
+  registerSpeakerEvents()
 
   basalt.onEvent("timer", onTimer)
   showPage(S.recommend_playlists, {})
   -- Load the default page once the UI is on screen, so a slow network never
-  -- delays the first paint.  The account check is deferred for the same
-  -- reason: it must not block boot when a cookie is present.
+  -- delays the first paint.  The account check is deferred for the same reason:
+  -- it must not block boot when a cookie is present.
   after(0.2, function() switchPage("home") end)
-  after(0.3, refreshUserLabel)
+  -- Verify any stored cookie against the server instead of trusting its mere
+  -- presence, and report a network failure rather than showing "logged out".
+  after(0.3, function() refreshLoginState({ notify = true }) end)
   return true
 end
 
