@@ -53,7 +53,7 @@
     * The server must allow the chosen mirror host in its http whitelist.
 
   Usage
-    wget run https://cdn.jsdelivr.net/gh/colorgarden/CC-CloudMusicNCM@main/install.lua
+    wget run https://ghproxy.net/https://raw.githubusercontent.com/colorgarden/CC-CloudMusicNCM/main/install.lua
     -- the installer then shows an interactive download-source menu
     -- (jsDelivr / GitHub raw / ghproxy.net / custom URL);
     -- pass a bundle base URL as the first argument to skip the menu:
@@ -81,7 +81,7 @@
 
 local CONFIG = {
   -- Where the dist/ archives are served from (overridable by argv[1]).
-  base = "https://cdn.jsdelivr.net/gh/colorgarden/CC-CloudMusicNCM@main",
+  base = "https://ghproxy.net/https://raw.githubusercontent.com/colorgarden/CC-CloudMusicNCM/main",
   -- Where ccncm/ is installed (must end with "/").
   root = "/",
   -- Client bundle path relative to the base URL.
@@ -914,9 +914,13 @@ end
 -- is a base URL and skips the menu, keeping the documented one-argument form
 -- working.
 local MIRRORS = {
-  { name = "jsDelivr (recommended)", base = "https://cdn.jsdelivr.net/gh/colorgarden/CC-CloudMusicNCM@main" },
+  -- ghproxy is first on purpose: it streams the live raw files, whereas
+  -- jsDelivr caches each file of an @main URL for a very long time and has
+  -- served a months-old dist/ccncm.tar (verified: 486400 B / 719-line app.lua
+  -- instead of the current 132096 B / 1185 lines).
+  { name = "ghproxy.net (recommended)", base = "https://ghproxy.net/https://raw.githubusercontent.com/colorgarden/CC-CloudMusicNCM/main" },
   { name = "GitHub raw", base = "https://raw.githubusercontent.com/colorgarden/CC-CloudMusicNCM/main" },
-  { name = "ghproxy.net (GitHub proxy)", base = "https://ghproxy.net/https://raw.githubusercontent.com/colorgarden/CC-CloudMusicNCM/main" },
+  { name = "jsDelivr (may serve a stale cached bundle)", base = "https://cdn.jsdelivr.net/gh/colorgarden/CC-CloudMusicNCM@main" },
 }
 
 local function trim(s)
