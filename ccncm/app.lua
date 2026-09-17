@@ -81,11 +81,12 @@ end
 
 local root
 local navFrame, navList
-local topFrame, pageTitle, backButton, userButton, searchInput
+local topFrame, pageTitle, backButton, userButton, searchInput, searchButton
 local contentFrame, contentList
 local playerFrame, playerTitle, playPauseButton
 local popupFrame, popupLabel
 local loginFrame, loginQrLabel, loginStatus, loginRefresh, loginCancel
+local logoutFrame, logoutLabel, logoutConfirm, logoutCancel, logoutBackdrop
 
 local timerHandlers = {}
 local currentQueue = {}
@@ -135,6 +136,16 @@ local speakerAlive = false
 local STOP_ACK_TIMEOUT = 4
 
 local GLYPH_H = 3
+
+-- The user (login) button is the rightmost widget in the top bar.  It never
+-- shrinks below the historical 11 cells, so a longer nickname is not clipped
+-- worse than before.
+local USER_BTN_MIN_W = 11
+
+-- Logout confirmation dialog state (the widgets are built in buildLayout).
+local logoutConfirmOpen = false
+local logoutShownCount = 0
+local lastLogoutQuestion = nil
 
 -- ============================================================================
 -- Timers
@@ -808,6 +819,35 @@ end
 -- Login (QR) and verified login state
 -- ============================================================================
 
+-- Width of the user button for `label`: fit the label, but never below the
+-- historical 11 cells and never so wide that it covers the back button (one
+-- blank column is kept between them).
+local function userButtonWidth(label)
+  local w = bimg.widthOf(bmp(label or S.login))
+  if w < USER_BTN_MIN_W then w = USER_BTN_MIN_W end
+  local frameW = topFrame and topFrame:getWidth() or w
+  local maxW = frameW
+  if backButton then
+    local backRight = backButton:getX() + backButton:getWidth() - 1
+    maxW = frameW - backRight - 1
+  end
+  if maxW < USER_BTN_MIN_W then maxW = USER_BTN_MIN_W end
+  if w > maxW then w = maxW end
+  return w
+end
+
+-- Keep the user button flush against the top bar's right edge on row 1 (the
+-- same row as the title and the back button).  Called whenever the label
+-- changes, because the width follows the label.
+local function layoutUserButton(label)
+  local w = userButtonWidth(label)
+  local frameW = topFrame and topFrame:getWidth() or w
+  userButton:setWidth(w)
+  userButton:setHeight(GLYPH_H)
+  userButton:setX(math.max(1, frameW - w + 1))
+  userButton:setY(1)
+end
+
 local function updateUserLabel()
   local st = data.session or {}
   local label = S.login
@@ -819,6 +859,33 @@ local function updateUserLabel()
   end
   lastUserLabel = label
   userButton:setImage(bmp(label))
+  layoutUserButton(label)
+end
+
+-- The drawn label is the UI's own record of what the user sees.  It only shows
+-- an account (not the login/user placeholder) after a verification succeeded
+-- with a nickname, which is the "cookie verified as logged-in" signal.
+local function userShowsAccount()
+  if lastUserLabel ~= nil and lastUserLabel ~= S.login and lastUserLabel ~= S.user then
+    return true
+  end
+  local st = data.session or {}
+  return type(st.nickname) == "string" and st.nickname ~= ""
+end
+
+-- ONE decision for a user-button click, derived from what the UI actually shows
+-- plus the verified session -- never from a single mutable field that can go
+-- stale:
+--   live session ("in")            -> logout confirmation
+--   verification failed ("unknown")-> retry verification (never the QR panel)
+--   logged out but an account is still shown (stale state) -> logout confirmation
+--   confirmed logged out ("out")   -> QR panel
+local function userButtonAction()
+  local st = data.session or {}
+  if st.state == "in" then return "logout" end
+  if st.state == "unknown" then return "retry" end
+  if userShowsAccount() then return "logout" end
+  return "login"
 end
 
 -- One-line startup diagnostic: cookie present? bytes? MUSIC_U? state + uid.
@@ -990,10 +1057,70 @@ local function openLogin()
   startLogin()
 end
 
-local function openLogout()
+-- Logout confirmation --------------------------------------------------------
+-- A small centred modal.  Only the confirm button logs out; Cancel (or just
+-- letting the dialog sit there) leaves the session and cookie untouched.  The
+-- full-screen backdrop swallows every click outside the dialog, so the page
+-- underneath can never be triggered while the confirmation is open.
+local function showLogoutConfirm()
+  local w = 26
+  local h = GLYPH_H * 2 + 3
+  logoutFrame:setWidth(w)
+  logoutFrame:setHeight(h)
+  logoutFrame:setX(math.max(1, math.floor((root:getWidth() - w) / 2) + 1))
+  logoutFrame:setY(math.max(1, math.floor((root:getHeight() - h) / 2) + 1))
+  logoutLabel:setWidth(math.max(1, w - 4))
+  logoutLabel:setY(1)
+  logoutConfirm:setY(GLYPH_H + 2)
+  logoutCancel:setY(GLYPH_H + 2)
+  logoutCancel:setX(math.max(1, w - logoutCancel:getWidth() - 1))
+  logoutBackdrop:setWidth(root:getWidth())
+  logoutBackdrop:setHeight(root:getHeight())
+  logoutBackdrop:setX(1)
+  logoutBackdrop:setY(1)
+  lastLogoutQuestion = S.confirm_logout
+  logoutConfirmOpen = true
+  logoutShownCount = logoutShownCount + 1
+  showFrame(logoutBackdrop, true)
+  showFrame(logoutFrame, true)
+end
+
+local function hideLogoutConfirm()
+  showFrame(logoutFrame, false)
+  showFrame(logoutBackdrop, false)
+  logoutConfirmOpen = false
+end
+
+local function confirmLogout()
+  hideLogoutConfirm()
   data.logout()
   updateUserLabel()
   notify(S.logout)
+end
+
+local function cancelLogout()
+  -- Close without touching the session or the cookie.
+  hideLogoutConfirm()
+end
+
+local function openLogout()
+  showLogoutConfirm()
+end
+
+-- The real click path (the button's onClick and the verification harness both
+-- call this) so the behaviour under test is exactly the behaviour shipped.
+local function onUserButtonClick()
+  local action = userButtonAction()
+  if action == "logout" then
+    openLogout()
+  elseif action == "retry" then
+    -- Verification failed earlier: retry instead of logging in again.
+    refreshLoginState({ notify = true })
+  else
+    -- Confirmed logged out (or no cookie): the QR panel opens on request.
+    openLogin()
+  end
+  return action
 end
 
 -- Read-only accessors for the pages and the verification harness.
@@ -1039,6 +1166,104 @@ end
 
 function M.startLogin()
   startLogin()
+end
+
+-- ============================================================================
+-- Verification accessors (UI geometry / click behaviour)
+-- ============================================================================
+
+-- The user button's geometry relative to the top bar, plus the top bar's own
+-- size and the button's absolute position, so the harness can assert the
+-- right edge is flush and dispatch a real click at the button.
+function M.userButtonGeometry()
+  if not userButton then return nil end
+  local x, y = userButton:getX(), userButton:getY()
+  local w, h = userButton:getWidth(), userButton:getHeight()
+  local fx = topFrame and topFrame:getX() or 0
+  local fy = topFrame and topFrame:getY() or 0
+  local fw = topFrame and topFrame:getWidth() or 0
+  return {
+    x = x, y = y, width = w, height = h,
+    right = x + w - 1,
+    frameWidth = fw,
+    flush = (x + w - 1) == fw,
+    globalX = fx + x - 1,
+    globalY = fy + y - 1,
+  }
+end
+
+-- Every top-bar box, so the harness can prove the user button does not overlap
+-- the search input or the search button.
+function M.topBarGeometry()
+  local function box(el)
+    if not el then return nil end
+    local x, y = el:getX(), el:getY()
+    local w, h = el:getWidth(), el:getHeight()
+    return {
+      x = x, y = y, width = w, height = h,
+      right = x + w - 1, bottom = y + h - 1,
+    }
+  end
+  return {
+    frameWidth = topFrame and topFrame:getWidth() or 0,
+    pageTitle = box(pageTitle),
+    backButton = box(backButton),
+    userButton = box(userButton),
+    searchInput = box(searchInput),
+    searchButton = box(searchButton),
+  }
+end
+
+-- What a user-button click decides from the single source of truth.
+function M.userButtonAction()
+  return userButtonAction()
+end
+
+-- Run the exact click path the button uses and return the chosen action.
+function M.clickUserButton()
+  return onUserButtonClick()
+end
+
+function M.logoutConfirmVisible()
+  return logoutConfirmOpen and true or false
+end
+
+function M.logoutConfirmShowCount()
+  return logoutShownCount
+end
+
+function M.logoutConfirmQuestion()
+  return lastLogoutQuestion
+end
+
+-- The confirmation dialog's boxes, so the harness can dispatch real clicks on
+-- its buttons (coordinates are relative to the dialog frame; the frame itself
+-- is a root child, so a button's absolute position is frame.x + button.x - 1).
+function M.logoutDialogGeometry()
+  local function box(el)
+    if not el then return nil end
+    local x, y = el:getX(), el:getY()
+    local w, h = el:getWidth(), el:getHeight()
+    return {
+      x = x, y = y, width = w, height = h,
+      right = x + w - 1, bottom = y + h - 1,
+    }
+  end
+  return {
+    frame = box(logoutFrame),
+    label = box(logoutLabel),
+    confirm = box(logoutConfirm),
+    cancel = box(logoutCancel),
+    backdrop = box(logoutBackdrop),
+  }
+end
+
+function M.confirmLogout()
+  confirmLogout()
+end
+
+function M.cancelLogout()
+  cancelLogout()
 end
 
 -- ============================================================================
@@ -1126,22 +1351,11 @@ local function buildLayout()
   backButton:onClick(goBack)
 
   userButton = topFrame:addButton({
-    x = contentW - 11, y = 1, width = 11, height = GLYPH_H,
+    x = contentW - USER_BTN_MIN_W + 1, y = 1, width = USER_BTN_MIN_W, height = GLYPH_H,
     foreground = colors.white, background = colors.pink,
   })
   userButton:setImage(bmp(S.login))
-  userButton:onClick(function()
-    local st = data.session or {}
-    if st.state == "in" then
-      openLogout()
-    elseif st.state == "unknown" then
-      -- Verification failed earlier: retry instead of logging in again.
-      refreshLoginState({ notify = true })
-    else
-      -- Confirmed logged out (or no cookie): the QR panel opens on request.
-      openLogin()
-    end
-  end)
+  userButton:onClick(onUserButtonClick)
 
   searchInput = topFrame:addInput({
     x = 1, y = GLYPH_H + 1, width = contentW - 7, height = 1,
@@ -1150,10 +1364,12 @@ local function buildLayout()
   })
   searchInput:onSubmit(function() doSearch() end)
 
-  topFrame:addButton({
+  searchButton = topFrame:addButton({
     x = contentW - 6, y = GLYPH_H + 1, width = 7, height = 1,
     foreground = colors.white, background = colors.pink,
-  }):setImage(bmp(S.search)):onClick(doSearch)
+  })
+  searchButton:setImage(bmp(S.search))
+  searchButton:onClick(doSearch)
 
   -- Content --------------------------------------------------------------
   contentFrame = root:addFrame({
@@ -1256,6 +1472,40 @@ local function buildLayout()
     stopLoginPoll()
     showFrame(loginFrame, false)
   end)
+
+  -- Logout confirmation.  The backdrop is added just before the dialog and
+  -- carries a high z, so while the dialog is open it is the first thing the
+  -- root dispatches to and it swallows every click that misses the dialog.
+  logoutBackdrop = root:addFrame({
+    x = 1, y = 1, width = W, height = H,
+    background = colors.black, visible = false, enabled = false, z = 500,
+  })
+  -- Registering the click makes the backdrop a mouse target: Basalt only
+  -- dispatches an event to a frame that listens for it, and a silent click sink
+  -- is exactly what stops a click outside the dialog reaching the page behind.
+  logoutBackdrop:onClick(function() end)
+  logoutFrame = root:addFrame({
+    x = 1, y = 1, width = 26, height = GLYPH_H * 2 + 3,
+    background = colors.gray, visible = false, enabled = false, z = 501,
+  })
+  logoutLabel = logoutFrame:addLabel({
+    x = 2, y = 1, width = 22, height = GLYPH_H,
+    autoSize = false, backgroundEnabled = true,
+    foreground = colors.white, background = colors.gray,
+  })
+  logoutLabel:setImage(bmp(S.confirm_logout))
+  logoutConfirm = logoutFrame:addButton({
+    x = 2, y = GLYPH_H + 2, width = 8, height = GLYPH_H,
+    foreground = colors.white, background = colors.pink,
+  })
+  logoutConfirm:setImage(bmp(S.confirm))
+  logoutConfirm:onClick(confirmLogout)
+  logoutCancel = logoutFrame:addButton({
+    x = 16, y = GLYPH_H + 2, width = 8, height = GLYPH_H,
+    foreground = colors.white, background = colors.pink,
+  })
+  logoutCancel:setImage(bmp(S.cancel))
+  logoutCancel:onClick(cancelLogout)
 end
 
 -- ============================================================================
